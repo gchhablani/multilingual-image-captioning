@@ -80,8 +80,6 @@ class FlaxViTBartModule(nn.Module):
 
         encoder_hidden_states = self.visual_projection(encoder_outputs[0])
 
-        print(encoder_hidden_states.shape)
-
         decoder_outputs = self.decoder(
             input_ids=decoder_input_ids,
             attention_mask=decoder_attention_mask,
