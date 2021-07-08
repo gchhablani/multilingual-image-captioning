@@ -97,7 +97,7 @@ def arrange_data(image_files, captions, image_urls):  # iterates through all the
         for lang in LANG_LIST:
             p_generate = map_name[lang_dict[lang]]
 
-            for image_file, caption, image_url in zip(tqdm(image_files, total=len(image_files), position=0, leave=False, desc="processing for {lang} currently"), captions, image_urls):  # add other captions
+            for image_file, caption, image_url in zip(tqdm(image_files, total=len(image_files), position=0, leave=False, desc=f"processing for {lang} currently"), captions, image_urls):  # add other captions
                 output = run_generate(caption, p_generate)
                 lis_.append({"image_file":image_file, "caption":output[0], "url":image_url, "lang_id": lang})
 
