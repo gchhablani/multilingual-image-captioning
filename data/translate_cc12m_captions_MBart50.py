@@ -47,19 +47,17 @@ model = FlaxMBartForConditionalGeneration.from_pretrained("facebook/mbart-large-
 tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50-one-to-many-mmt", src_lang="en_XX")
 
 p_params = replicate(model.params)
-rng = jax.random.PRNGKey(0)
-rngs = jax.random.split(rng, num_devices)
 
-def generatefr_XX(params, batch, rng):
-      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], prng_key=rng, params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"]).sequences
+def generatefr_XX(params, batch):
+      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"], num_beams=4, max_length=64).sequences
       return output_ids
 
-def generatees_XX(params, batch, rng):
-      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], prng_key=rng, params=params, forced_bos_token_id=tokenizer.lang_code_to_id["es_XX"]).sequences
+def generatees_XX(params, batch):
+      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["es_XX"], num_beams=4, max_length=64).sequences
       return output_ids
 
-def generatede_DE(params, batch, rng):
-      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], prng_key=rng, params=params, forced_bos_token_id=tokenizer.lang_code_to_id["de_DE"]).sequences
+def generatede_DE(params, batch):
+      output_ids = model.generate(batch["input_ids"], attention_mask=batch["attention_mask"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["de_DE"], num_beams=4, max_length=64).sequences
       return output_ids
 
 # def generateru_RU(params, batch, rng):
@@ -81,8 +79,8 @@ map_name = {
 def run_generate(input_str, p_generate):
     inputs = tokenizer([input_str for i in range(num_devices)], return_tensors="jax", padding="max_length", truncation=True, max_length=64)
     p_inputs = shard(inputs.data)
-    output_ids = p_generate(p_params, p_inputs, rngs)
-    output_strings = tokenizer.batch_decode(output_ids[0], skip_special_tokens=True, max_length=30)
+    output_ids = p_generate(p_params, p_inputs)
+    output_strings = tokenizer.batch_decode(output_ids[0], skip_special_tokens=True, max_length=64)
     return output_strings
 
 def read_tsv_file(tsv_path):
