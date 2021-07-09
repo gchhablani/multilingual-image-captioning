@@ -10,7 +10,8 @@ logger = logging.get_logger(__name__)
 class CLIPVisionMBartConfig(PretrainedConfig):
 
     model_type = "clip-vision-mbart"
-
+    is_composition = True
+    
     def __init__(self, clip_vision_config_dict, mbart_config_dict, **kwargs):
         super().__init__(**kwargs)
 

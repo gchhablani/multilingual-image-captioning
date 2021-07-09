@@ -766,6 +766,6 @@ class FlaxCLIPVisionMBartForConditionalGeneration(
         return model
 
 
-# flax_clip_vision_mbart_cg = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained('google/vit-base-patch16-224-in21k', 'facebook/mbart-large')
+# flax_clip_vision_mbart_cg = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained('openai/clip-vit-base-patch32', 'facebook/mbart-large')
 # outputs = flax_clip_vision_mbart_cg(pixel_values, input_ids, attention_mask, position_ids, output_hidden_states=True)
 # flax_vit_bart_cg.generate(input_ids=pixel_values, decoder_start_token_id=tokenizer.lang_code_to_id['en_XX'])s
