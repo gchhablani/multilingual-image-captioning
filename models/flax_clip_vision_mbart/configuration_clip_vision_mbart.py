@@ -11,19 +11,22 @@ class CLIPVisionMBartConfig(PretrainedConfig):
 
     model_type = "clip-vision-mbart"
     is_composition = True
-    
-    def __init__(self, clip_vision_config_dict, mbart_config_dict, **kwargs):
+
+    def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-        if mbart_config_dict is None:
-            raise ValueError("`mbart_config_dict` can not be `None`.")
+        if "mbart_config" not in kwargs:
+            raise ValueError("`mbart_config` can not be `None`.")
 
-        if clip_vision_config_dict is None:
-            raise ValueError("`clip_vision_config_dict` can not be `None`.")
+        if "clip_vision_config" not in kwargs:
+            raise ValueError("`clip_vision_config` can not be `None`.")
 
-        self.mbart_config = MBartConfig(**mbart_config_dict)
+        mbart_config = kwargs.pop("mbart_config")
+        clip_vision_config = kwargs.pop("clip_vision_config")
 
-        self.clip_vision_config = CLIPVisionConfig(**clip_vision_config_dict)
+        self.mbart_config = MBartConfig(**mbart_config)
+
+        self.clip_vision_config = CLIPVisionConfig(**clip_vision_config)
 
         self.is_encoder_decoder = True
 
@@ -35,8 +38,8 @@ class CLIPVisionMBartConfig(PretrainedConfig):
         **kwargs
     ):
         return cls(
-            clip_vision_config_dict=clip_vision_config.to_dict(),
-            mbart_config_dict=mbart_config.to_dict(),
+            clip_vision_config=clip_vision_config.to_dict(),
+            mbart_config=mbart_config.to_dict(),
             **kwargs
         )
 

@@ -693,6 +693,13 @@ class FlaxCLIPVisionMBartForConditionalGeneration(
         return model_kwargs
 
     @classmethod
+    def from_pretrained(cls, *args, **kwargs):
+        # At the moment fast initialization is not supported
+        # for composite models
+        # kwargs["_fast_init"] = False
+        return super().from_pretrained(*args, **kwargs)
+
+    @classmethod
     def from_clip_vision_mbart_pretrained(
         cls,
         clip_vision_model_name_or_path: str = None,
