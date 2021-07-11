@@ -1,6 +1,8 @@
 import csv
 from functools import partial
 import logging
+import nltk
+from nltk.tokenize import word_tokenize
 import numpy as np
 import pandas as pd
 import os
@@ -11,6 +13,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import torch
+from datasets import load_metric
 from torchvision.datasets import VisionDataset
 from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import CenterCrop, ConvertImageDtype, Normalize, Resize, GaussianBlur
@@ -21,7 +24,7 @@ import jax
 import jax.numpy as jnp
 import optax
 import transformers
-from flax import jax_utils
+from flax import jax_utils, traverse_util
 from flax.jax_utils import unreplicate
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, shard, shard_prng_key, get_metrics, onehot
@@ -131,6 +134,9 @@ class DataTrainingArguments:
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
             "value if set."
         },
+    )
+    predict_with_generate: bool = field(
+        default=True, metadata={"help": "Whether to use generate to calculate generative metrics (ROUGE, BLEU)."}
     )
     overwrite_cache: bool = field(
         default=False, metadata={"help": "Overwrite the cached training and evaluation sets"}
@@ -304,6 +310,20 @@ def main():
         "es": tokenizer_es,
     }
 
+    map_lang_code = {
+        "en": "en_XX",
+        "de": "de_DE",
+        "fr": "fr_XX",
+        "es": "es_XX",
+    }
+
+    map_lang_num = {
+        "en": 0,
+        "de": 1,
+        "fr": 2,
+        "es": 3,
+    }
+
     # if model_args.tokenizer_name:
     #     tokenizer = AutoTokenizer.from_pretrained(
     #         model_args.tokenizer_name, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
@@ -378,11 +398,14 @@ def main():
 
         inputs = helper_colate(lang_id, captions)
 
+        # had to create another enum of sorts for lang_id
+        lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+
         batch = {
             "pixel_values": pixel_values,
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
-            # "lang": lang_id,
+            "lang": lang_id,
             # "caption": captions,
         }
 
@@ -409,7 +432,37 @@ def main():
         collate_fn=collate_fn,
     )
 
-    # print(next(iter(eval_loader)))
+    # Metric
+    metric = load_metric("rouge")
+
+    def postprocess_text(preds, labels):
+        preds = [pred.strip() for pred in preds]
+        labels = [label.strip() for label in labels]
+
+        # rougeLSum expects newline after each sentence
+        preds = ["\n".join(nltk.sent_tokenize(pred, language='german')) for pred in preds]
+        labels = ["\n".join(nltk.sent_tokenize(label, language='german')) for label in labels]
+
+        return preds, labels
+
+    def compute_metrics(preds, labels, lang):
+        lang = [list(map_lang_num.keys())[i] for i in lang]
+
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+
+        # Some simple post-processing
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+
+        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
+        # Extract a few results from ROUGE
+        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+
+        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
+        result["gen_len"] = np.mean(prediction_lens)
+        result = {k: round(v, 4) for k, v in result.items()}
+        return result
+
 
     # Enable tensorboard only on the master node
     if has_tensorboard and jax.process_index() == 0:
@@ -428,6 +481,14 @@ def main():
         training_args.learning_rate,
     )
 
+    def decay_mask_fn(params):  # Ask Suraj/Patrick if we should use it or not
+        flat_params = traverse_util.flatten_dict(params)
+        layer_norm_params = [
+            (name, "scale") for name in ["self_attn_layer_norm", "layernorm_embedding", "final_layer_norm"]
+        ]
+        flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
+        return traverse_util.unflatten_dict(flat_mask)
+
     # create adam optimizer
     adamw = optax.adamw(
         learning_rate=linear_decay_lr_schedule_fn,
@@ -435,6 +496,7 @@ def main():
         b2=training_args.adam_beta2,
         eps=training_args.adam_epsilon,
         weight_decay=training_args.weight_decay,
+        mask=decay_mask_fn,
     )
 
     # Setup train state
@@ -446,7 +508,6 @@ def main():
         The label smoothing implementation is adapted from Flax's official example:
         https://github.com/google/flax/blob/87a211135c6a377c8f29048a1cac3840e38b9da4/examples/wmt/train.py#L104
         """
-        # print("BLAHHHH")
         # print(labels[0])
         # print(labels[0].shape)
         # print("logits shape:", logits.shape)
@@ -460,6 +521,7 @@ def main():
         # print("logits shape:", logits.shape)
         # print("$$$$$$$")
         # print("labels:", len(labels))
+        # print("labels0 shape:", labels[0].shape)
         soft_labels = onehot(labels[0], vocab_size, on_value=confidence, off_value=low_confidence)
 
         loss = optax.softmax_cross_entropy(logits, soft_labels)
@@ -506,24 +568,23 @@ def main():
         metrics = jax.lax.pmean(metrics, axis_name="batch")
         return metrics
 
-    # num_beams = data_args.num_beams
-    # gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
+    num_beams = 4
+    gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
-    # def generate_step(params, batch):
-    #     model.params = params
-    #     output_ids = model.generate(batch["pixel_values"], attention_mask=batch["attention_mask"], **gen_kwargs)
-    #     return output_ids.sequences
+    def generate_step(params, batch):
+        model.params = params
+        tokenizer = map_tokenizer_lang[list(map_lang_num.keys())[batch["lang"]]]
+        output_ids = model.generate(batch["pixel_values"], decoder_start_token_id= tokenizer.lang_code_to_id[map_lang_code[list(map_lang_num.keys())[batch["lang"]]]], **gen_kwargs)  # forced_bos_token_id, decoder_start_token_id, or bos_token_id
+        return output_ids.sequences
 
     # Create parallel version of the train and eval step
     p_train_step = jax.pmap(partial(train_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch", donate_argnums=(0,))
-    p_eval_step = jax.pmap(eval_step, "batch")
 
+    p_eval_step = jax.pmap(partial(eval_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch")
+    p_generate_step = jax.pmap(generate_step, "batch")
 
     # Replicate the train state on each device
     state = state.replicate()
-    p_eval_step = jax.pmap(partial(eval_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch")
-    # p_generate_step = jax.pmap(generate_step, "batch")
-
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -551,7 +612,6 @@ def main():
         # train
         for batch in train_loader:
             batch = shard(batch)
-            # batch = shard(next(iter(batch)))
             state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
@@ -569,24 +629,44 @@ def main():
 
         # ======================== Evaluating ==============================
         eval_metrics = []
+        eval_preds = []
+        eval_labels = []
+        eval_langs = []
+
         eval_steps = len(eval_dataset) // eval_batch_size
         eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
         for batch in eval_loader:
             # Model forward
             batch = shard(batch)
+            labels = batch["input_ids"]
+            langs = batch["lang"]
+
             metrics = p_eval_step(state.params, batch)
             eval_metrics.append(metrics)
+
+            # generation
+            if data_args.predict_with_generate:
+                generated_ids = p_generate_step(state.params, batch)
+                eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
+                eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
+                eval_langs.extend(jax.device_get(langs.reshape(-1, langs.shape[-1])))
 
             eval_step_progress_bar.update(1)
 
         # normalize eval metrics
         eval_metrics = get_metrics(eval_metrics)
-
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+
+        # compute ROUGE metrics
+        rouge_desc = ""
+        if data_args.predict_with_generate:
+            rouge_metrics = compute_metrics(eval_preds, eval_labels, eval_langs)
+            eval_metrics.update(rouge_metrics)
+            rouge_desc = " ".join([f"Eval {key}: {value} |" for key, value in rouge_metrics.items()])
 
         # Print metrics and update progress bar
         eval_step_progress_bar.close()
-        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']})"
+        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']} | {rouge_desc})"
         epochs.write(desc)
         epochs.desc = desc
 
