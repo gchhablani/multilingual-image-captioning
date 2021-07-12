@@ -34,6 +34,7 @@ from transformers import MBart50TokenizerFast, HfArgumentParser, TrainingArgumen
 
 logger = logging.getLogger(__name__)
 
+'''
 # Cache the result
 has_tensorboard = is_tensorboard_available()
 if has_tensorboard:
@@ -48,7 +49,7 @@ else:
         "Unable to display metrics through TensorBoard because the package is not installed: "
         "Please run pip install tensorboard to enable."
     )
-
+'''
 print("TPU cores available:", jax.device_count())
 
 @dataclass
@@ -298,17 +299,17 @@ def main():
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    tokenizer_en = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="en_XX")
-    tokenizer_de = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="de_DE")
-    tokenizer_fr = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="fr_XX")
-    tokenizer_es = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="es_XX")
+    tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50")
+    # tokenizer_de = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="de_DE")
+    # tokenizer_fr = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="fr_XX")
+    # tokenizer_es = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="es_XX")
 
-    map_tokenizer_lang = {
-        "en": tokenizer_en,
-        "de": tokenizer_de,
-        "fr": tokenizer_fr,
-        "es": tokenizer_es,
-    }
+    # map_tokenizer_lang = {
+    #     "en": tokenizer_en,
+    #     "de": tokenizer_de,
+    #     "fr": tokenizer_fr,
+    #     "es": tokenizer_es,
+    # }
 
     map_lang_code = {
         "en": "en_XX",
@@ -361,11 +362,29 @@ def main():
         transform=preprocess,
     )
 
-    eval_dataset = ImageTextDataset(
-        data_args.data_dir,
-        data_args.validation_file,
-        transform=preprocess,
-    )
+    _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
+    lang_list = ["en", "fr", "es", "de"]
+
+    for i in lang_list:  # splits validation file into 4 subsets
+        subset_lang_tsv = _df[_df["lang_id"]==i]
+        subset_lang_tsv.reset_index(drop=True, inplace=True)
+        path = os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file))
+        subset_lang_tsv.to_csv(path, index=False, sep="\t")
+        # print(subset_lang_tsv.head(5))
+
+    val_paths = []
+    for i in lang_list:
+        val_paths.append(os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file)))
+
+    eval_dataset = []
+    for i in range(len(lang_list)):
+        dataset = ImageTextDataset(
+            data_args.data_dir,
+            val_paths[i],
+            transform=preprocess,
+        )
+        eval_dataset.append(dataset)
+
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
@@ -377,9 +396,10 @@ def main():
         inputs = {}
 
         for num, (lang,caption) in enumerate(zip(lang_id,captions)):
-            tokenizer = map_tokenizer_lang[lang]
-            with tokenizer.as_target_tokenizer():
-                tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+            # tokenizer = map_tokenizer_lang[lang]
+            tokenizer.tgt_lang = map_lang_code[lang]
+            # with tokenizer.as_target_tokenizer():
+            tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
             if num==0:
                 inputs["input_ids"] = tokens["input_ids"]
                 inputs["attention_mask"] = tokens["attention_mask"]
@@ -411,6 +431,28 @@ def main():
 
         return batch
 
+    def collate_fn_val(examples):
+        pixel_values = torch.stack([example[0] for example in examples]).permute(0, 2, 3, 1).numpy()
+        captions = [example[1] for example in examples]
+        lang_id = [example[2] for example in examples]
+
+        # tokenizer = map_tokenizer_lang[lang_id[0]]
+        tokenizer.tgt_lang = map_lang_code[lang_id[0]]  # every validation loader has same language
+        # with tokenizer.as_target_tokenizer():
+        tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+
+        # had to create another enum of sorts for lang_id
+        lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+
+        batch = {
+            "pixel_values": pixel_values,
+            "input_ids": tokens["input_ids"],
+            "attention_mask": tokens["attention_mask"],
+            "lang": lang_id,
+            # "caption": captions,
+        }
+        return batch
+
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -422,16 +464,26 @@ def main():
         collate_fn=collate_fn,
     )
 
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=data_args.preprocessing_num_workers,
-        persistent_workers=True,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
+    eval_loader = []
+    for i in range(len(lang_list)):
+        loader = torch.utils.data.DataLoader(
+            eval_dataset[i],
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=data_args.preprocessing_num_workers,
+            persistent_workers=True,
+            drop_last=True,
+            collate_fn=collate_fn_val,
+        )
+        eval_loader.append(loader)
 
+    # print("train_loader:", next(iter(train_loader)))
+
+    # for i in range(len(lang_list)):
+    #     print(f"{lang_list[i]} loader:", next(iter(eval_loader[i])))
+
+
+    '''
     # Metric
     metric = load_metric("rouge")
 
@@ -462,11 +514,11 @@ def main():
         result["gen_len"] = np.mean(prediction_lens)
         result = {k: round(v, 4) for k, v in result.items()}
         return result
+    '''
 
-
-    # Enable tensorboard only on the master node
-    if has_tensorboard and jax.process_index() == 0:
-        summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir).joinpath("logs").as_posix())
+    # # Enable tensorboard only on the master node
+    # if has_tensorboard and jax.process_index() == 0:
+    #     summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir).joinpath("logs").as_posix())
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -481,13 +533,13 @@ def main():
         training_args.learning_rate,
     )
 
-    def decay_mask_fn(params):  # Ask Suraj/Patrick if we should use it or not
-        flat_params = traverse_util.flatten_dict(params)
-        layer_norm_params = [
-            (name, "scale") for name in ["self_attn_layer_norm", "layernorm_embedding", "final_layer_norm"]
-        ]
-        flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
-        return traverse_util.unflatten_dict(flat_mask)
+    # def decay_mask_fn(params):  # Ask Suraj/Patrick if we should use it or not
+    #     flat_params = traverse_util.flatten_dict(params)
+    #     layer_norm_params = [
+    #         (name, "scale") for name in ["self_attn_layer_norm", "layernorm_embedding", "final_layer_norm"]
+    #     ]
+    #     flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
+    #     return traverse_util.unflatten_dict(flat_mask)
 
     # create adam optimizer
     adamw = optax.adamw(
@@ -496,7 +548,7 @@ def main():
         b2=training_args.adam_beta2,
         eps=training_args.adam_epsilon,
         weight_decay=training_args.weight_decay,
-        mask=decay_mask_fn,
+        # mask=decay_mask_fn,
     )
 
     # Setup train state
@@ -568,13 +620,41 @@ def main():
         metrics = jax.lax.pmean(metrics, axis_name="batch")
         return metrics
 
-    num_beams = 4
-    gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
+    num_beams = 4  # model has beam size 5, should we keep 4 or 5 here?
+    gen_kwargs = {decoder_start_token_id= tokenizer.lang_code_to_id[map_lang_code[lang]], "max_length": data_args.max_seq_length, "num_beams": num_beams}
 
-    def generate_step(params, batch):
+    # def generateen_XX(params, batch):
+    #   output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"], num_beams=4, max_length=64).sequences
+    #   return output_ids
+
+    # def generatefr_XX(params, batch):
+    #   output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"], num_beams=4, max_length=64).sequences
+    #   return output_ids
+
+    # def generatees_XX(params, batch):
+    #     output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["es_XX"], num_beams=4, max_length=64).sequences
+    #     return output_ids
+
+    # def generatede_DE(params, batch):
+    #     output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["de_DE"], num_beams=4, max_length=64).sequences
+    #     return output_ids
+
+    def generate_step(params, batch, lang, lang_dict=map_lang_num):
         model.params = params
-        tokenizer = map_tokenizer_lang[list(map_lang_num.keys())[batch["lang"]]]
-        output_ids = model.generate(batch["pixel_values"], decoder_start_token_id= tokenizer.lang_code_to_id[map_lang_code[list(map_lang_num.keys())[batch["lang"]]]], **gen_kwargs)  # forced_bos_token_id, decoder_start_token_id, or bos_token_id
+        # print(lang)
+        print("***")
+        lang_dict = {value:key for key, value in lang_dict.items()}
+        # lang = list(map_lang_num.keys())[lang]
+        # print(jax.numpy(batch["lang"]))
+        print(lang_dict[lang])
+        lang = lang_dict[lang]
+
+        # lang_code = (batch["lang"])[0]
+        # tokenizer = map_tokenizer_lang[list(map_lang_num.keys())[lang_code]]
+        # lang = list(map_lang_num.keys())[lang]
+        tokenizer.tgt_lang = map_lang_code[lang]
+        print(map_lang_code[lang])
+        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)  # forced_bos_token_id, decoder_start_token_id, or bos_token_id
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
@@ -607,6 +687,7 @@ def main():
         train_metrics = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
+        '''
 
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
@@ -626,55 +707,79 @@ def main():
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
         )
-
+        '''
         # ======================== Evaluating ==============================
         eval_metrics = []
-        eval_preds = []
-        eval_labels = []
-        eval_langs = []
+        rouge_metrics_total = []
 
-        eval_steps = len(eval_dataset) // eval_batch_size
+        eval_steps = len(eval_dataset[0])*4 // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
         eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
-        for batch in eval_loader:
-            # Model forward
-            batch = shard(batch)
-            labels = batch["input_ids"]
-            langs = batch["lang"]
+        for lang_eval_loader in eval_loader:
 
-            metrics = p_eval_step(state.params, batch)
-            eval_metrics.append(metrics)
+            eval_preds = []
+            eval_labels = []
+            eval_langs = []
 
-            # generation
+            for batch in lang_eval_loader:
+                # Model forward
+                # print(batch.keys())
+                # print(batch["input_ids"].shape)
+                lang = batch["lang"]
+                # print(lang)
+                # print(type(lang))
+                # print(lang[0])
+                # print(type(lang[0]))
+                # print(lang[0][0], type(lang[0][0]))
+                batch = shard(batch)
+                labels = batch["input_ids"]
+
+                metrics = p_eval_step(state.params, batch)
+                eval_metrics.append(metrics)  # Review by Suraj and Patrick how we are appending losses for all langs in eval_metrics
+
+                # generation
+                if data_args.predict_with_generate:
+                    generated_ids = p_generate_step(state.params, batch, int(lang[0]))
+                    eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
+                    eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
+                    # eval_langs.extend(jax.device_get(langs.reshape(-1, langs.shape[-1])))
+
+
+                eval_step_progress_bar.update(1)
+            '''
+            # compute ROUGE metrics
+            rouge_desc = ""
             if data_args.predict_with_generate:
-                generated_ids = p_generate_step(state.params, batch)
-                eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
-                eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
-                eval_langs.extend(jax.device_get(langs.reshape(-1, langs.shape[-1])))
+                rouge_metrics = compute_metrics(eval_preds, eval_labels, eval_langs)  # eval_langs would contain one lang only
+                eval_metrics.update(rouge_metrics)
+                rouge_desc = " ".join([f"Eval {key}: {value} |" for key, value in rouge_metrics.items()])
+                rouge_metrics_total.append(rouge_desc)
+            '''
 
-            eval_step_progress_bar.update(1)
 
         # normalize eval metrics
+        # print("eval_metrics vanilla:", eval_metrics)
         eval_metrics = get_metrics(eval_metrics)
+        # print("eval_metrics after get_metrics:", eval_metrics)
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
+        # print("eval_metrics final:", eval_metrics)
 
-        # compute ROUGE metrics
-        rouge_desc = ""
-        if data_args.predict_with_generate:
-            rouge_metrics = compute_metrics(eval_preds, eval_labels, eval_langs)
-            eval_metrics.update(rouge_metrics)
-            rouge_desc = " ".join([f"Eval {key}: {value} |" for key, value in rouge_metrics.items()])
-
+        '''
         # Print metrics and update progress bar
         eval_step_progress_bar.close()
         desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']} | {rouge_desc})"
         epochs.write(desc)
         epochs.desc = desc
+        '''
+         # Print metrics and update progress bar
+        eval_step_progress_bar.close()
+        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']}"
+        epochs.write(desc)
+        epochs.desc = desc
 
-        # Save metrics
-        if has_tensorboard and jax.process_index() == 0:
-            cur_step = epoch * (len(train_dataset) // train_batch_size)
-            write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
-
+        # # Save metrics
+        # if has_tensorboard and jax.process_index() == 0:
+        #     cur_step = epoch * (len(train_dataset) // train_batch_size)
+        #     write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
 
 
 if __name__ == "__main__":
