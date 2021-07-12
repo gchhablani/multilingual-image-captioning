@@ -34,7 +34,7 @@ from transformers import MBart50TokenizerFast, HfArgumentParser, TrainingArgumen
 
 logger = logging.getLogger(__name__)
 
-'''
+
 # Cache the result
 has_tensorboard = is_tensorboard_available()
 if has_tensorboard:
@@ -49,7 +49,7 @@ else:
         "Unable to display metrics through TensorBoard because the package is not installed: "
         "Please run pip install tensorboard to enable."
     )
-'''
+
 print("TPU cores available:", jax.device_count())
 
 @dataclass
@@ -195,6 +195,13 @@ class ImageTextDataset(VisionDataset):
 
         examples = pd.read_csv(file_path, sep='\t')
 
+        self.map_lang_code = {
+            "en": "en_XX",
+            "de": "de_DE",
+            "fr": "fr_XX",
+            "es": "es_XX",
+        }
+
         self.image_paths = examples["image_file"].values
         self.captions = examples["caption"].values
         self.lang = examples["lang_id"].values
@@ -221,6 +228,7 @@ class ImageTextDataset(VisionDataset):
         image = self._load_image(index)
         target = self._load_target(index)
         lang = self._load_lang(index)
+        lang = self.map_lang_code[lang]
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
@@ -242,12 +250,25 @@ def write_metric(summary_writer, train_metrics, eval_metrics, train_time, step):
 
     train_metrics = get_metrics(train_metrics)
     for key, vals in train_metrics.items():
-        tag = f"train_{key}"
+        tag = f"train/{key}"
         for i, val in enumerate(vals):
             summary_writer.scalar(tag, val, step - len(vals) + i + 1)
 
-    for metric_name, value in eval_metrics.items():
-        summary_writer.scalar(f"eval_{metric_name}", value, step)
+    writable_eval_metrics = {}
+    for key,value in eval_metrics.items():
+        if isinstance(value,dict):
+            for sub_key,sub_value in value.items():
+                writable_eval_metrics[sub_key+"/"+key] = sub_value
+        else:
+            writable_eval_metrics[key]=value
+
+
+    for metric_name, value in writable_eval_metrics.items():
+        if metric_name =="loss":
+            summary_writer.scalar(f"eval_{metric_name}", value, step)
+        else:
+            summary_writer.scalar(f"{metric_name}", value, step)
+
 
 def create_learning_rate_fn(
     train_ds_size: int, train_batch_size: int, num_train_epochs: int, num_warmup_steps: int, learning_rate: float
@@ -261,6 +282,7 @@ def create_learning_rate_fn(
     )
     schedule_fn = optax.join_schedules(schedules=[warmup_fn, decay_fn], boundaries=[num_warmup_steps])
     return schedule_fn
+
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
@@ -300,29 +322,19 @@ def main():
     logger.info(f"Training/evaluation parameters {training_args}")
 
     tokenizer = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50")
-    # tokenizer_de = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="de_DE")
-    # tokenizer_fr = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="fr_XX")
-    # tokenizer_es = MBart50TokenizerFast.from_pretrained("facebook/mbart-large-50", src_lang="en_XX", tgt_lang="es_XX")
-
-    # map_tokenizer_lang = {
-    #     "en": tokenizer_en,
-    #     "de": tokenizer_de,
-    #     "fr": tokenizer_fr,
-    #     "es": tokenizer_es,
-    # }
-
-    map_lang_code = {
-        "en": "en_XX",
-        "de": "de_DE",
-        "fr": "fr_XX",
-        "es": "es_XX",
-    }
 
     map_lang_num = {
-        "en": 0,
-        "de": 1,
-        "fr": 2,
-        "es": 3,
+        "en_XX": 0,
+        "de_DE": 1,
+        "fr_XX": 2,
+        "es_XX": 3,
+    }
+
+    map_bart_nltk = {
+        "en_XX": "english",
+        "de_DE": "german",
+        "fr_XX": "french",
+        "es_XX": "spanish",
     }
 
     # if model_args.tokenizer_name:
@@ -397,7 +409,7 @@ def main():
 
         for num, (lang,caption) in enumerate(zip(lang_id,captions)):
             # tokenizer = map_tokenizer_lang[lang]
-            tokenizer.tgt_lang = map_lang_code[lang]
+            tokenizer.tgt_lang = lang
             # with tokenizer.as_target_tokenizer():
             tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
             if num==0:
@@ -426,7 +438,6 @@ def main():
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
             "lang": lang_id,
-            # "caption": captions,
         }
 
         return batch
@@ -437,7 +448,7 @@ def main():
         lang_id = [example[2] for example in examples]
 
         # tokenizer = map_tokenizer_lang[lang_id[0]]
-        tokenizer.tgt_lang = map_lang_code[lang_id[0]]  # every validation loader has same language
+        tokenizer.tgt_lang = lang_id[0]  # every validation loader has same language
         # with tokenizer.as_target_tokenizer():
         tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
 
@@ -449,7 +460,6 @@ def main():
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"],
             "lang": lang_id,
-            # "caption": captions,
         }
         return batch
 
@@ -460,7 +470,7 @@ def main():
         shuffle=True,
         num_workers=data_args.preprocessing_num_workers,
         persistent_workers=True,
-        drop_last=True,
+        drop_last=False,
         collate_fn=collate_fn,
     )
 
@@ -472,53 +482,42 @@ def main():
             shuffle=False,
             num_workers=data_args.preprocessing_num_workers,
             persistent_workers=True,
-            drop_last=True,
+            drop_last=False,
             collate_fn=collate_fn_val,
         )
         eval_loader.append(loader)
 
-    # print("train_loader:", next(iter(train_loader)))
-
-    # for i in range(len(lang_list)):
-    #     print(f"{lang_list[i]} loader:", next(iter(eval_loader[i])))
-
-
-    '''
     # Metric
-    metric = load_metric("rouge")
+    metric = load_metric("bleu")
 
-    def postprocess_text(preds, labels):
+    def postprocess_text(preds, labels, lang):
         preds = [pred.strip() for pred in preds]
         labels = [label.strip() for label in labels]
 
-        # rougeLSum expects newline after each sentence
-        preds = ["\n".join(nltk.sent_tokenize(pred, language='german')) for pred in preds]
-        labels = ["\n".join(nltk.sent_tokenize(label, language='german')) for label in labels]
+        preds = [nltk.word_tokenize(pred, language=lang) for pred in preds]
+
+        # put in another list as seen https://github.com/huggingface/datasets/blob/256156b29ce2f4bb1ccedce0638491e440b0d1a2/metrics/bleu/bleu.py#L82
+        labels = [[nltk.word_tokenize(label, language=lang)] for label in labels]
 
         return preds, labels
 
     def compute_metrics(preds, labels, lang):
-        lang = [list(map_lang_num.keys())[i] for i in lang]
-
-        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True)
-        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True)
+        decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True, max_length=64)
+        decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True, max_length=64)
 
         # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels, map_bart_nltk[lang])
 
-        result = metric.compute(predictions=decoded_preds, references=decoded_labels, use_stemmer=True)
-        # Extract a few results from ROUGE
-        result = {key: value.mid.fmeasure * 100 for key, value in result.items()}
+        result = {}
+        for i in range(1,5):
+            tmp = metric.compute(predictions=decoded_preds, references=decoded_labels, max_order=i)
+            result[f"BLEU-{i}"] = tmp["bleu"]
 
-        prediction_lens = [np.count_nonzero(pred != tokenizer.pad_token_id) for pred in preds]
-        result["gen_len"] = np.mean(prediction_lens)
-        result = {k: round(v, 4) for k, v in result.items()}
         return result
-    '''
 
-    # # Enable tensorboard only on the master node
-    # if has_tensorboard and jax.process_index() == 0:
-    #     summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir).joinpath("logs").as_posix())
+    # Enable tensorboard only on the master node
+    if has_tensorboard and jax.process_index() == 0:
+        summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir).joinpath("logs").as_posix())
 
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
@@ -533,14 +532,6 @@ def main():
         training_args.learning_rate,
     )
 
-    # def decay_mask_fn(params):  # Ask Suraj/Patrick if we should use it or not
-    #     flat_params = traverse_util.flatten_dict(params)
-    #     layer_norm_params = [
-    #         (name, "scale") for name in ["self_attn_layer_norm", "layernorm_embedding", "final_layer_norm"]
-    #     ]
-    #     flat_mask = {path: (path[-1] != "bias" and path[-2:] not in layer_norm_params) for path in flat_params}
-    #     return traverse_util.unflatten_dict(flat_mask)
-
     # create adam optimizer
     adamw = optax.adamw(
         learning_rate=linear_decay_lr_schedule_fn,
@@ -548,7 +539,6 @@ def main():
         b2=training_args.adam_beta2,
         eps=training_args.adam_epsilon,
         weight_decay=training_args.weight_decay,
-        # mask=decay_mask_fn,
     )
 
     # Setup train state
@@ -560,9 +550,7 @@ def main():
         The label smoothing implementation is adapted from Flax's official example:
         https://github.com/google/flax/blob/87a211135c6a377c8f29048a1cac3840e38b9da4/examples/wmt/train.py#L104
         """
-        # print(labels[0])
-        # print(labels[0].shape)
-        # print("logits shape:", logits.shape)
+
         vocab_size = logits.shape[-1]
 
         confidence = 1.0 - label_smoothing_factor
@@ -570,10 +558,7 @@ def main():
         normalizing_constant = -(
             confidence * jnp.log(confidence) + (vocab_size - 1) * low_confidence * jnp.log(low_confidence + 1e-20)
         )
-        # print("logits shape:", logits.shape)
-        # print("$$$$$$$")
-        # print("labels:", len(labels))
-        # print("labels0 shape:", labels[0].shape)
+
         soft_labels = onehot(labels[0], vocab_size, on_value=confidence, off_value=low_confidence)
 
         loss = optax.softmax_cross_entropy(logits, soft_labels)
@@ -621,39 +606,10 @@ def main():
         return metrics
 
     num_beams = 4  # model has beam size 5, should we keep 4 or 5 here?
-    gen_kwargs = {decoder_start_token_id= tokenizer.lang_code_to_id[map_lang_code[lang]], "max_length": data_args.max_seq_length, "num_beams": num_beams}
+    gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
-    # def generateen_XX(params, batch):
-    #   output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"], num_beams=4, max_length=64).sequences
-    #   return output_ids
-
-    # def generatefr_XX(params, batch):
-    #   output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["fr_XX"], num_beams=4, max_length=64).sequences
-    #   return output_ids
-
-    # def generatees_XX(params, batch):
-    #     output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["es_XX"], num_beams=4, max_length=64).sequences
-    #     return output_ids
-
-    # def generatede_DE(params, batch):
-    #     output_ids = model.generate(batch["pixel_values"], params=params, forced_bos_token_id=tokenizer.lang_code_to_id["de_DE"], num_beams=4, max_length=64).sequences
-    #     return output_ids
-
-    def generate_step(params, batch, lang, lang_dict=map_lang_num):
+    def generate_step(params, batch):
         model.params = params
-        # print(lang)
-        print("***")
-        lang_dict = {value:key for key, value in lang_dict.items()}
-        # lang = list(map_lang_num.keys())[lang]
-        # print(jax.numpy(batch["lang"]))
-        print(lang_dict[lang])
-        lang = lang_dict[lang]
-
-        # lang_code = (batch["lang"])[0]
-        # tokenizer = map_tokenizer_lang[list(map_lang_num.keys())[lang_code]]
-        # lang = list(map_lang_num.keys())[lang]
-        tokenizer.tgt_lang = map_lang_code[lang]
-        print(map_lang_code[lang])
         output_ids = model.generate(batch["pixel_values"], **gen_kwargs)  # forced_bos_token_id, decoder_start_token_id, or bos_token_id
         return output_ids.sequences
 
@@ -687,7 +643,6 @@ def main():
         train_metrics = []
 
         steps_per_epoch = len(train_dataset) // train_batch_size
-        '''
 
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
@@ -707,10 +662,10 @@ def main():
         epochs.write(
             f"Epoch... ({epoch + 1}/{num_epochs} | Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})"
         )
-        '''
+
         # ======================== Evaluating ==============================
         eval_metrics = []
-        rouge_metrics_total = []
+        bleu_metrics_total = {}
 
         eval_steps = len(eval_dataset[0])*4 // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
         eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating...", position=2, leave=False)
@@ -718,68 +673,51 @@ def main():
 
             eval_preds = []
             eval_labels = []
-            eval_langs = []
+            curr_lang = ""
 
             for batch in lang_eval_loader:
                 # Model forward
-                # print(batch.keys())
-                # print(batch["input_ids"].shape)
                 lang = batch["lang"]
-                # print(lang)
-                # print(type(lang))
-                # print(lang[0])
-                # print(type(lang[0]))
-                # print(lang[0][0], type(lang[0][0]))
                 batch = shard(batch)
                 labels = batch["input_ids"]
 
                 metrics = p_eval_step(state.params, batch)
                 eval_metrics.append(metrics)  # Review by Suraj and Patrick how we are appending losses for all langs in eval_metrics
 
+                curr_lang = list(map_lang_num.keys())[lang[0]]
                 # generation
                 if data_args.predict_with_generate:
-                    generated_ids = p_generate_step(state.params, batch, int(lang[0]))
+                    gen_kwargs.update({"decoder_start_token_id": tokenizer.lang_code_to_id[curr_lang]})
+                    generated_ids = p_generate_step(state.params, batch)
                     eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
                     eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
-                    # eval_langs.extend(jax.device_get(langs.reshape(-1, langs.shape[-1])))
 
 
                 eval_step_progress_bar.update(1)
-            '''
-            # compute ROUGE metrics
-            rouge_desc = ""
-            if data_args.predict_with_generate:
-                rouge_metrics = compute_metrics(eval_preds, eval_labels, eval_langs)  # eval_langs would contain one lang only
-                eval_metrics.update(rouge_metrics)
-                rouge_desc = " ".join([f"Eval {key}: {value} |" for key, value in rouge_metrics.items()])
-                rouge_metrics_total.append(rouge_desc)
-            '''
 
+            # compute ROUGE metrics
+            if data_args.predict_with_generate:
+                bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
+                # print(bleu_metrics)
+                bleu_metrics_total[curr_lang] = bleu_metrics
 
         # normalize eval metrics
-        # print("eval_metrics vanilla:", eval_metrics)
         eval_metrics = get_metrics(eval_metrics)
-        # print("eval_metrics after get_metrics:", eval_metrics)
         eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
-        # print("eval_metrics final:", eval_metrics)
 
-        '''
+        eval_metrics.update(bleu_metrics_total)
+        bleu_desc = " ".join([f"BLEU score {key}: {value} |" for key, value in bleu_metrics_total.items()])
+
         # Print metrics and update progress bar
         eval_step_progress_bar.close()
-        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']} | {rouge_desc})"
-        epochs.write(desc)
-        epochs.desc = desc
-        '''
-         # Print metrics and update progress bar
-        eval_step_progress_bar.close()
-        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']}"
+        desc = f"Epoch... ({epoch + 1}/{num_epochs} | Eval Loss: {eval_metrics['loss']} | {bleu_desc})"
         epochs.write(desc)
         epochs.desc = desc
 
-        # # Save metrics
-        # if has_tensorboard and jax.process_index() == 0:
-        #     cur_step = epoch * (len(train_dataset) // train_batch_size)
-        #     write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
+        # Save metrics
+        if has_tensorboard and jax.process_index() == 0:
+            cur_step = epoch * (len(train_dataset) // train_batch_size)
+            write_metric(summary_writer, train_metrics, eval_metrics, train_time, cur_step)
 
 
 if __name__ == "__main__":
