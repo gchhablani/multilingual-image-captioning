@@ -1,8 +1,7 @@
-import csv
 from functools import partial
+import gc
 import logging
 import nltk
-from nltk.tokenize import word_tokenize
 import numpy as np
 import pandas as pd
 import os
@@ -203,11 +202,19 @@ class ImageTextDataset(VisionDataset):
             "es": "es_XX",
         }
 
+        for idx,img_file in enumerate(examples["image_file"].values):
+            if os.path.exists(os.path.join(self.root,img_file)):
+                self.image_paths.append(img_file)
+                self.captions.append(examples["caption"].values[idx])
+                self.lang.append(examples["lang_id"].values[idx])
+
+
         if max_samples is None:
-            max_samples = examples.shape[0]
-        self.image_paths = examples["image_file"].values[:max_samples]
-        self.captions = examples["caption"].values[:max_samples]
-        self.lang = examples["lang_id"].values[:max_samples]
+            max_samples = len(self.image_paths)
+
+        self.image_paths = self.image_paths[:max_samples]
+        self.captions = self.captions[:max_samples]
+        self.lang = self.lang[:max_samples]
 
         # with open(file_path, encoding="utf-8") as fd:
         #     examples = csv.DictReader(fd, delimiter="\t", quotechar='"')
@@ -384,7 +391,7 @@ def main():
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    tokenizer = MBart50TokenizerFast.from_pretrained(training_args.mbart_tokenizer_name)
+    tokenizer = MBart50TokenizerFast.from_pretrained(model_args.mbart_tokenizer_name)
 
     map_lang_num = {
         "en_XX": 0,
@@ -414,7 +421,7 @@ def main():
     #         "You can do it from another script, save it, and load it from here, using --tokenizer_name."
     #     )
 
-    if training_args.resume_from_checkpoint is not None:
+    if training_args.resume_from_checkpoint is None:
         model = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained(
             model_args.vision_model_name_or_path,
             model_args.text_model_name_or_path,
@@ -438,7 +445,7 @@ def main():
         data_args.data_dir,
         data_args.train_file,
         transform=preprocess,
-        max_samples = training_args.max_train_samples
+        max_samples = data_args.max_train_samples
     )
 
     _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
@@ -460,7 +467,7 @@ def main():
             data_args.data_dir,
             val_paths[i],
             transform=preprocess,
-            max_samples=training_args.max_eval_samples_per_lang
+            max_samples=data_args.max_eval_samples_per_lang
         )
         eval_dataset.append(dataset)
 
@@ -530,6 +537,8 @@ def main():
         }
         return batch
 
+    logger.info(f"Creating train data loader")
+
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
         train_dataset,
@@ -540,6 +549,8 @@ def main():
         drop_last=False,
         collate_fn=collate_fn,
     )
+
+    logger.info(f"Creating eval data loader")
 
     eval_loader = []
     for i in range(len(lang_list)):
@@ -735,7 +746,7 @@ def main():
 
         epochs.desc = f"Epoch:  ({epoch+1}/{num_epochs})"
 
-        # steps_per_epoch = len(train_dataset) // train_batch_size
+        steps_per_epoch = len(train_dataset) // train_batch_size
 
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
@@ -756,6 +767,7 @@ def main():
                 epochs.write(f"Log at Step: {cur_step} (Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})")
 
                 train_metrics = [] # TODO: Check why is this being done? WHat is this needed for?
+                gc.collect()
 
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
 
@@ -788,6 +800,7 @@ def main():
                             generated_ids = p_generate_step(state.params, batch)
                             eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
                             eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
+
                         eval_step_progress_bar.update(1)
 
                     # compute BLEU metrics
@@ -795,6 +808,8 @@ def main():
                         bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
                         # print(bleu_metrics)
                         bleu_metrics_total[curr_lang] = bleu_metrics
+
+                    gc.collect()
 
                 # normalize eval metrics
                 eval_metrics = get_metrics(eval_metrics)
@@ -807,6 +822,7 @@ def main():
                 eval_step_progress_bar.close()
                 epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']} | {bleu_desc})")
                 # epochs.desc = desc
+                gc.collect()
 
                 # Save metrics
                 if has_tensorboard and jax.process_index() == 0:
@@ -823,18 +839,25 @@ def main():
                     #     commit_message=f"Saving weights and logs of step {cur_step}",
                     # )
                     save_model_checkpoint(model, training_args.output_dir, state, logger, training_args.push_to_hub_organization, with_opt=True, push_to_hub=training_args.push_to_hub, overwrite=True)
+                    gc.collect()
                     # if model_args.save_optimizer:
                     #     # this saves full state including optimizer
                     #     save_checkpoint(training_args.output_dir, state, state.step, keep=training_args.save_total_limit, overwrite=True)
                     if training_args.save_total_limit is not None:
                         rotate_checkpoints(training_args.output_dir, training_args.save_total_limit, logger)
-            train_step_progress_bar.close()
-            epochs.update(1)
+                        gc.collect()
+
+
             if cur_step==total_train_steps:
                 break_all=True
                 break
+
+        train_step_progress_bar.close()
+        epochs.update(1)
+        gc.collect()
         if break_all:
             break
 
 if __name__ == "__main__":
     main()
+
