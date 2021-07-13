@@ -275,7 +275,6 @@ def write_eval_metric(summary_writer, eval_metrics, step):
         else:
             writable_eval_metrics[key]=value
 
-
     for metric_name, value in writable_eval_metrics.items():
         if metric_name =="loss":
             summary_writer.scalar(f"eval_{metric_name}", value, step)
@@ -303,6 +302,7 @@ def mb_item(x):
 #checkpoint functions
 def save_model_checkpoint(model, save_dir, state, logger, organization,  with_opt:bool=False, push_to_hub:bool=False, overwrite=False, **kwargs):
     state = jax_utils.unreplicate(state)
+    # gc.collect()
     logger.info(f"Saving Checkpoint in {save_dir}")
     ckpt_save_dir = f"{save_dir}/ckpt-{mb_item(state.step)-1}"
     if os.path.exists(ckpt_save_dir) and not overwrite:
@@ -321,6 +321,7 @@ def save_model_checkpoint(model, save_dir, state, logger, organization,  with_op
                 json.dump({"step": state.step.item()}, f)
 
         logger.info("checkpoint saved")
+        # gc.collect()
 
         if push_to_hub:
             repo_name = Path(save_dir).name
@@ -449,6 +450,7 @@ def main():
     )
 
     _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
+    # gc.collect()
     lang_list = ["en", "fr", "es", "de"]
 
     for i in lang_list:  # splits validation file into 4 subsets
@@ -470,6 +472,8 @@ def main():
             max_samples=data_args.max_eval_samples_per_lang
         )
         eval_dataset.append(dataset)
+
+    # gc.collect()
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
@@ -546,7 +550,7 @@ def main():
         shuffle=True,
         num_workers=data_args.preprocessing_num_workers,
         persistent_workers=True,
-        drop_last=False,
+        drop_last=True,
         collate_fn=collate_fn,
     )
 
@@ -560,13 +564,14 @@ def main():
             shuffle=False,
             num_workers=data_args.preprocessing_num_workers,
             persistent_workers=True,
-            drop_last=False,
+            drop_last=True,
             collate_fn=collate_fn_val,
         )
         eval_loader.append(loader)
 
     # Metric
     metric = load_metric("bleu")
+    # gc.collect()
 
     def postprocess_text(preds, labels, lang):
         preds = [pred.strip() for pred in preds]
@@ -580,17 +585,23 @@ def main():
         return preds, labels
 
     def compute_metrics(preds, labels, lang):
+        print("preds in compute_metrics:", preds)
+
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True, max_length=64)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True, max_length=64)
 
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels, map_bart_nltk[lang])
 
+        # print(decoded_preds)
+        # print(len(decoded_preds), len(decoded_labels))
+
         result = {}
         for i in range(1,5):
             tmp = metric.compute(predictions=decoded_preds, references=decoded_labels, max_order=i)
             result[f"BLEU-{i}"] = tmp["bleu"]
 
+        # gc.collect()
         return result
 
     # Enable tensorboard only on the master node
@@ -705,8 +716,7 @@ def main():
     gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
     def generate_step(params, batch):
-        model.params = params
-        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)
+        output_ids = model.generate(batch["pixel_values"], params=params, **gen_kwargs)
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
@@ -736,6 +746,7 @@ def main():
     epochs = tqdm(range(epoch_start_point, num_epochs), desc=f"Epoch:  ({epoch_start_point+1}/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
+        epochs.update(1)
         train_start = time.time()
         train_metrics = []
 
@@ -767,7 +778,6 @@ def main():
                 epochs.write(f"Log at Step: {cur_step} (Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})")
 
                 train_metrics = [] # TODO: Check why is this being done? WHat is this needed for?
-                gc.collect()
 
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
 
@@ -789,6 +799,7 @@ def main():
                         lang = batch["lang"]
                         batch = shard(batch)
                         labels = batch["input_ids"] # TODO: Check if this works correctly since this is sharded
+                        # print(labels.shape)
 
                         metrics = p_eval_step(state.params, batch)
                         eval_metrics.append(metrics)
@@ -798,6 +809,7 @@ def main():
                         if data_args.predict_with_generate:
                             gen_kwargs.update({"decoder_start_token_id": tokenizer.lang_code_to_id[curr_lang]})
                             generated_ids = p_generate_step(state.params, batch)
+                            # print("generated_ids:", generated_ids)
                             eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
                             eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
 
@@ -806,10 +818,10 @@ def main():
                     # compute BLEU metrics
                     if data_args.predict_with_generate:
                         bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
-                        # print(bleu_metrics)
                         bleu_metrics_total[curr_lang] = bleu_metrics
+                        # gc.collect()
 
-                    gc.collect()
+                    # gc.collect()
 
                 # normalize eval metrics
                 eval_metrics = get_metrics(eval_metrics)
@@ -822,11 +834,12 @@ def main():
                 eval_step_progress_bar.close()
                 epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']} | {bleu_desc})")
                 # epochs.desc = desc
-                gc.collect()
 
                 # Save metrics
                 if has_tensorboard and jax.process_index() == 0:
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
+
+                eval_metrics = []
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -839,13 +852,13 @@ def main():
                     #     commit_message=f"Saving weights and logs of step {cur_step}",
                     # )
                     save_model_checkpoint(model, training_args.output_dir, state, logger, training_args.push_to_hub_organization, with_opt=True, push_to_hub=training_args.push_to_hub, overwrite=True)
-                    gc.collect()
+                    # gc.collect()
                     # if model_args.save_optimizer:
                     #     # this saves full state including optimizer
                     #     save_checkpoint(training_args.output_dir, state, state.step, keep=training_args.save_total_limit, overwrite=True)
                     if training_args.save_total_limit is not None:
                         rotate_checkpoints(training_args.output_dir, training_args.save_total_limit, logger)
-                        gc.collect()
+                        # gc.collect()
 
 
             if cur_step==total_train_steps:
@@ -853,11 +866,10 @@ def main():
                 break
 
         train_step_progress_bar.close()
-        epochs.update(1)
-        gc.collect()
+        # gc.collect()
+
         if break_all:
             break
 
 if __name__ == "__main__":
     main()
-
