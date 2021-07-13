@@ -249,7 +249,6 @@ class TrainState(train_state.TrainState):
 
 
 
-
 def write_train_metric(summary_writer, train_metrics, train_time, step):
     summary_writer.scalar("train_time", train_time, step)
 
@@ -274,7 +273,7 @@ def write_eval_metric(summary_writer, eval_metrics, step):
         if metric_name =="loss":
             summary_writer.scalar(f"eval_{metric_name}", value, step)
         else:
-            summary_writer.scalar(f"{metric_name}", value, step)    
+            summary_writer.scalar(f"{metric_name}", value, step)
 
 
 def create_learning_rate_fn(
@@ -315,7 +314,7 @@ def save_model_checkpoint(model, save_dir, state, logger, organization,  with_op
                 json.dump({"step": state.step.item()}, f)
 
         logger.info("checkpoint saved")
-        
+
         if push_to_hub:
             repo_name = Path(save_dir).name
             repo_url = PushToHubMixin._get_repo_url_from_name(repo_name, organization=organization, private=False, use_auth_token=True)
@@ -355,11 +354,6 @@ def rotate_checkpoints(ckpt_dir:str, save_total_limit:int, logger):
 
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
-
-    # ToDo
-    # 1. output_dir
-    # 2. upload_to_hub
-    # 3. check others
 
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
@@ -455,7 +449,6 @@ def main():
         subset_lang_tsv.reset_index(drop=True, inplace=True)
         path = os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file))
         subset_lang_tsv.to_csv(path, index=False, sep="\t")
-        # print(subset_lang_tsv.head(5))
 
     val_paths = []
     for i in lang_list:
@@ -655,7 +648,6 @@ def main():
         soft_labels = onehot(labels[0], vocab_size, on_value=confidence, off_value=low_confidence)
 
         loss = optax.softmax_cross_entropy(logits, soft_labels)
-        # print("soft_labels shape:", soft_labels)
         loss = loss - normalizing_constant
 
         # ignore padded tokens from loss
@@ -703,7 +695,7 @@ def main():
 
     def generate_step(params, batch):
         model.params = params
-        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)  # forced_bos_token_id, decoder_start_token_id, or bos_token_id
+        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
@@ -738,7 +730,7 @@ def main():
 
         # Create sampling rng
         rng, input_rng = jax.random.split(rng)
-        
+
         num_train_samples = len(train_dataset)
 
         epochs.desc = f"Epoch:  ({epoch+1}/{num_epochs})"
@@ -764,7 +756,7 @@ def main():
                 epochs.write(f"Log at Step: {cur_step} (Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})")
 
                 train_metrics = [] # TODO: Check why is this being done? WHat is this needed for?
-            
+
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
 
                 eval_metrics = []
@@ -772,7 +764,7 @@ def main():
 
                 # TODO: Check if this is correct
                 eval_steps = len(eval_dataset[0])*4 // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
-                
+
                 eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating: ", position=2, leave=False)
                 for lang_eval_loader in eval_loader:
 
