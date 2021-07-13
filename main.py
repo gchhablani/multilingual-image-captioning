@@ -205,9 +205,18 @@ class ImageTextDataset(VisionDataset):
 
         if max_samples is None:
             max_samples = examples.shape[0]
-        self.image_paths = examples["image_file"].values[:max_samples]
-        self.captions = examples["caption"].values[:max_samples]
-        self.lang = examples["lang_id"].values[:max_samples]
+
+        for idx,img_file in enumerate(examples["image_file"].values):
+            if os.path.exists(os.path.join(self.root,img_file)):
+                self.image_paths.append(img_file)
+                self.captions.append(examples["caption"].values[idx])
+                self.lang.append(examples["lang_id"].values[idx])
+
+
+
+        self.image_paths = self.image_paths.values[:max_samples]
+        self.captions = self.captions.values[:max_samples]
+        self.lang = self.lang.values[:max_samples]
 
         # with open(file_path, encoding="utf-8") as fd:
         #     examples = csv.DictReader(fd, delimiter="\t", quotechar='"')
