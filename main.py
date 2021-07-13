@@ -203,9 +203,6 @@ class ImageTextDataset(VisionDataset):
             "es": "es_XX",
         }
 
-        if max_samples is None:
-            max_samples = examples.shape[0]
-
         for idx,img_file in enumerate(examples["image_file"].values):
             if os.path.exists(os.path.join(self.root,img_file)):
                 self.image_paths.append(img_file)
@@ -213,10 +210,12 @@ class ImageTextDataset(VisionDataset):
                 self.lang.append(examples["lang_id"].values[idx])
 
 
+        if max_samples is None:
+            max_samples = len(self.image_paths)
 
-        self.image_paths = self.image_paths.values[:max_samples]
-        self.captions = self.captions.values[:max_samples]
-        self.lang = self.lang.values[:max_samples]
+        self.image_paths = self.image_paths[:max_samples]
+        self.captions = self.captions[:max_samples]
+        self.lang = self.lang[:max_samples]
 
         # with open(file_path, encoding="utf-8") as fd:
         #     examples = csv.DictReader(fd, delimiter="\t", quotechar='"')
@@ -447,7 +446,7 @@ def main():
         data_args.data_dir,
         data_args.train_file,
         transform=preprocess,
-        max_samples = training_args.max_train_samples
+        max_samples = data_args.max_train_samples
     )
 
     _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
@@ -469,7 +468,7 @@ def main():
             data_args.data_dir,
             val_paths[i],
             transform=preprocess,
-            max_samples=training_args.max_eval_samples_per_lang
+            max_samples=data_args.max_eval_samples_per_lang
         )
         eval_dataset.append(dataset)
 
