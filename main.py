@@ -1,8 +1,7 @@
-import csv
 from functools import partial
+import gc
 import logging
 import nltk
-from nltk.tokenize import word_tokenize
 import numpy as np
 import pandas as pd
 import os
@@ -36,6 +35,8 @@ from flax.training.common_utils import get_metrics, shard, shard_prng_key, get_m
 from models.flax_clip_vision_mbart.modeling_clip_vision_mbart import FlaxCLIPVisionMBartForConditionalGeneration
 from transformers import MBart50TokenizerFast, HfArgumentParser, TrainingArguments, is_tensorboard_available, set_seed
 
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger(__name__)
 
@@ -111,11 +112,11 @@ class DataTrainingArguments:
         metadata={"help": "The data directory containing input files."}
     )
     train_file: Optional[str] = field(
-        default="/home/user/data/CC12M/val_file.tsv",  # TODO
+        default=None,  # TODO
         metadata={"help": "The input training data file (a jsonlines file)."}
     )
     validation_file: Optional[str] = field(
-        default="/home/user/data/CC12M/val_file.tsv",  # TODO
+        default=None,  # TODO
         metadata={"help": "An optional input evaluation data file (a jsonlines file)."},
     )
     max_seq_length: Optional[int] = field(
@@ -195,6 +196,7 @@ class ImageTextDataset(VisionDataset):
         self.lang = []
 
         examples = pd.read_csv(file_path, sep='\t')
+        # gc.collect()
 
         self.map_lang_code = {
             "en": "en_XX",
@@ -209,6 +211,9 @@ class ImageTextDataset(VisionDataset):
                 self.captions.append(examples["caption"].values[idx])
                 self.lang.append(examples["lang_id"].values[idx])
 
+        # self.image_paths = examples["image_file"].values
+        # self.captions = examples["caption"].values
+        # self.lang = examples["lang_id"].values
 
         if max_samples is None:
             max_samples = len(self.image_paths)
@@ -227,7 +232,11 @@ class ImageTextDataset(VisionDataset):
 
     def _load_image(self, idx: int):
         path = self.image_paths[idx]
-        return read_image(os.path.join(self.root,path), mode=ImageReadMode.RGB)
+        try:
+            return read_image(os.path.join(self.root,path), mode=ImageReadMode.RGB)
+        except:
+            path = self.image_paths[0]
+            return read_image(os.path.join(self.root,path), mode=ImageReadMode.RGB)
 
     def _load_target(self, idx):
         return self.captions[idx]
@@ -276,7 +285,6 @@ def write_eval_metric(summary_writer, eval_metrics, step):
         else:
             writable_eval_metrics[key]=value
 
-
     for metric_name, value in writable_eval_metrics.items():
         if metric_name =="loss":
             summary_writer.scalar(f"eval_{metric_name}", value, step)
@@ -304,6 +312,7 @@ def mb_item(x):
 #checkpoint functions
 def save_model_checkpoint(model, save_dir, state, logger, organization,  with_opt:bool=False, push_to_hub:bool=False, overwrite=False, **kwargs):
     state = jax_utils.unreplicate(state)
+    gc.collect()
     logger.info(f"Saving Checkpoint in {save_dir}")
     ckpt_save_dir = f"{save_dir}/ckpt-{mb_item(state.step)-1}"
     if os.path.exists(ckpt_save_dir) and not overwrite:
@@ -322,6 +331,7 @@ def save_model_checkpoint(model, save_dir, state, logger, organization,  with_op
                 json.dump({"step": state.step.item()}, f)
 
         logger.info("checkpoint saved")
+        gc.collect()
 
         if push_to_hub:
             repo_name = Path(save_dir).name
@@ -360,6 +370,19 @@ def rotate_checkpoints(ckpt_dir:str, save_total_limit:int, logger):
         logger.info(f"Deleting older checkpoint [{ckpt}] due to save_total_limit ({save_total_limit})")
         shutil.rmtree(ckpt)
 
+# In Flax, for seq2seq models we need to pass `decoder_input_ids`
+# as the Flax models don't accept `labels`, we need to prepare the decoder_input_ids here
+# for that dynamically import the `shift_tokens_right` function from the model file
+def shift_tokens_right(input_ids: np.array, pad_token_id: int):
+    """
+    Shift input ids one token to the right.
+    """
+    shifted_input_ids = np.zeros(input_ids.shape, dtype=np.int64)
+    shifted_input_ids[:, 1:] = input_ids[:, :-1]
+    shifted_input_ids[:, 0] = pad_token_id
+    return shifted_input_ids
+
+
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
 
@@ -392,7 +415,7 @@ def main():
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    tokenizer = MBart50TokenizerFast.from_pretrained(training_args.mbart_tokenizer_name)
+    tokenizer = MBart50TokenizerFast.from_pretrained(model_args.mbart_tokenizer_name)
 
     map_lang_num = {
         "en_XX": 0,
@@ -422,7 +445,7 @@ def main():
     #         "You can do it from another script, save it, and load it from here, using --tokenizer_name."
     #     )
 
-    if training_args.resume_from_checkpoint is not None:
+    if training_args.resume_from_checkpoint is None:
         model = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained(
             model_args.vision_model_name_or_path,
             model_args.text_model_name_or_path,
@@ -437,9 +460,13 @@ def main():
     # set seed for torch dataloaders
     set_seed(training_args.seed)
 
+    logger.info(f"Creating and jitting subscriptable transform")
+
     # Initialize torchvision transforms and jit them for faster processing
     preprocess = Transform(config.clip_vision_config.image_size)
     preprocess = torch.jit.script(preprocess)
+
+    logger.info(f"Creating train_dataset from ImageTextDataset")
 
     # Initialize the image-text dataset
     train_dataset = ImageTextDataset(
@@ -450,7 +477,10 @@ def main():
     )
 
     _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
+    gc.collect()
     lang_list = ["en", "fr", "es", "de"]
+
+    logger.info(f"Splitting validations TSVs")
 
     for i in lang_list:  # splits validation file into 4 subsets
         subset_lang_tsv = _df[_df["lang_id"]==i]
@@ -462,6 +492,9 @@ def main():
     for i in lang_list:
         val_paths.append(os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file)))
 
+    logger.info(f"creating eval dataset from ImageTextDataset")
+    # gc.collect()
+
     eval_dataset = []
     for i in range(len(lang_list)):
         dataset = ImageTextDataset(
@@ -472,6 +505,8 @@ def main():
         )
         eval_dataset.append(dataset)
 
+    gc.collect()
+
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
     train_batch_size = int(training_args.per_device_train_batch_size) * jax.device_count()
@@ -479,22 +514,24 @@ def main():
     steps_per_epoch = len(train_dataset) // train_batch_size
     total_train_steps = steps_per_epoch * num_epochs
 
-    def helper_collate(lang_id, captions):
-        inputs = {}
+    logger.info(f"initialising shift tokens right from model")
 
-        for num, (lang,caption) in enumerate(zip(lang_id,captions)):
-            # tokenizer = map_tokenizer_lang[lang]
-            tokenizer.tgt_lang = lang
-            # with tokenizer.as_target_tokenizer():
-            tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
-            if num==0:
-                inputs["input_ids"] = tokens["input_ids"]
-                inputs["attention_mask"] = tokens["attention_mask"]
-            else:
-                inputs["input_ids"] = np.concatenate([inputs["input_ids"], tokens["input_ids"]])
-                inputs["attention_mask"] = np.concatenate([inputs["attention_mask"], tokens["attention_mask"]])
+    # def helper_collate(lang_id, captions):
+    #     inputs = {}
 
-        return inputs
+    #     for num, (lang,caption) in enumerate(zip(lang_id,captions)):
+    #         # tokenizer = map_tokenizer_lang[lang]
+    #         tokenizer.tgt_lang = lang
+    #         with tokenizer.as_target_tokenizer():
+    #             tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+    #         if num==0:
+    #             inputs["input_ids"] = tokens["input_ids"]
+    #             inputs["attention_mask"] = tokens["attention_mask"]
+    #         else:
+    #             inputs["input_ids"] = np.concatenate([inputs["input_ids"], tokens["input_ids"]])
+    #             inputs["attention_mask"] = np.concatenate([inputs["attention_mask"], tokens["attention_mask"]])
+
+    #     return inputs
 
 
     # Use collate function to tokenizer the text and convert the processed images to numpy
@@ -503,16 +540,33 @@ def main():
         captions = [example[1] for example in examples]
         lang_id = [example[2] for example in examples]
 
-        inputs = helper_collate(lang_id, captions)
+        # inputs = helper_collate(lang_id, captions)
+        inputs = {}
+
+        for num, (lang,caption) in enumerate(zip(lang_id,captions)):
+            # tokenizer = map_tokenizer_lang[lang]
+            tokenizer.tgt_lang = lang
+            with tokenizer.as_target_tokenizer():
+                tokens = tokenizer(str(caption), max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+            if num==0:
+                inputs["input_ids"] = tokens["input_ids"]
+                inputs["attention_mask"] = tokens["attention_mask"]
+            else:
+                inputs["input_ids"] = np.concatenate([inputs["input_ids"], tokens["input_ids"]])
+                inputs["attention_mask"] = np.concatenate([inputs["attention_mask"], tokens["attention_mask"]])
+
 
         # had to create another enum of sorts for lang_id
-        lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+        # lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+
+        decoder_input_ids = shift_tokens_right(inputs["input_ids"], config.mbart_config.pad_token_id)
 
         batch = {
             "pixel_values": pixel_values,
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
-            "lang": lang_id,
+            "decoder_input_ids": decoder_input_ids,
+            # "lang": lang_id,
         }
 
         return batch
@@ -524,19 +578,23 @@ def main():
 
         # tokenizer = map_tokenizer_lang[lang_id[0]]
         tokenizer.tgt_lang = lang_id[0]  # every validation loader has same language
-        # with tokenizer.as_target_tokenizer():
-        tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+        with tokenizer.as_target_tokenizer():
+            tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
 
         # had to create another enum of sorts for lang_id
-        lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+        # lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
+        decoder_input_ids = shift_tokens_right(tokens["input_ids"], config.mbart_config.pad_token_id)
 
         batch = {
             "pixel_values": pixel_values,
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"],
-            "lang": lang_id,
+            "decoder_input_ids": decoder_input_ids,
+            # "lang": lang_id,
         }
         return batch
+
+    logger.info(f"Creating train data loader")
 
     # Create data loaders
     train_loader = torch.utils.data.DataLoader(
@@ -544,10 +602,12 @@ def main():
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=data_args.preprocessing_num_workers,
-        persistent_workers=True,
-        drop_last=False,
+        # persistent_workers=True,
+        drop_last=True,
         collate_fn=collate_fn,
     )
+
+    logger.info(f"Creating eval data loader")
 
     eval_loader = []
     for i in range(len(lang_list)):
@@ -556,14 +616,15 @@ def main():
             batch_size=eval_batch_size,
             shuffle=False,
             num_workers=data_args.preprocessing_num_workers,
-            persistent_workers=True,
-            drop_last=False,
+            # persistent_workers=True,
+            drop_last=True,
             collate_fn=collate_fn_val,
         )
         eval_loader.append(loader)
 
     # Metric
     metric = load_metric("bleu")
+    gc.collect()
 
     def postprocess_text(preds, labels, lang):
         preds = [pred.strip() for pred in preds]
@@ -574,30 +635,40 @@ def main():
         # put in another list as seen https://github.com/huggingface/datasets/blob/256156b29ce2f4bb1ccedce0638491e440b0d1a2/metrics/bleu/bleu.py#L82
         labels = [[nltk.word_tokenize(label, language=lang)] for label in labels]
 
+        gc.collect()
         return preds, labels
 
     def compute_metrics(preds, labels, lang):
+
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True, max_length=64)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True, max_length=64)
 
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels, map_bart_nltk[lang])
 
+        # print(decoded_preds)
+        # print(len(decoded_preds), len(decoded_labels))
+
         result = {}
         for i in range(1,5):
             tmp = metric.compute(predictions=decoded_preds, references=decoded_labels, max_order=i)
             result[f"BLEU-{i}"] = tmp["bleu"]
 
+        gc.collect()
         return result
 
     # Enable tensorboard only on the master node
     if has_tensorboard and jax.process_index() == 0:
         summary_writer = SummaryWriter(log_dir=Path(training_args.output_dir).joinpath("logs").as_posix())
 
+    # # Initialize our training
+    # rng = jax.random.PRNGKey(training_args.seed)
+    # # rng, dropout_rng = jax.random.split(rng)
+    # dropout_rngs = jax.random.split(rng, jax.local_device_count())
+
     # Initialize our training
     rng = jax.random.PRNGKey(training_args.seed)
-    # rng, dropout_rng = jax.random.split(rng)
-    dropout_rngs = jax.random.split(rng, jax.local_device_count())
+    rng, dropout_rng = jax.random.split(rng)
 
 
     # Create learning rate schedule
@@ -619,23 +690,23 @@ def main():
     )
 
     # Setup train state
-    # state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dropout_rng=dropout_rng)
-    if training_args.resume_from_checkpoint is None:
-        state = train_state.TrainState.create(
-            apply_fn=model.__call__, params=model.params, tx=adamw
-        )
-    else:
-        state = train_state.TrainState.create(
-            apply_fn=model.__call__, params=model.params, tx=adamw
-        )
-        params, opt_state, step = restore_model_checkpoint(training_args.resume_from_checkpoint, state, logger)
-        state = state.replace(
-            step=step,
-            apply_fn=model.__call__,
-            params=params,
-            tx=adamw,
-            opt_state=opt_state,
-        )
+    state = TrainState.create(apply_fn=model.__call__, params=model.params, tx=adamw, dropout_rng=dropout_rng)
+    # if training_args.resume_from_checkpoint is None:
+    #     state = train_state.TrainState.create(
+    #         apply_fn=model.__call__, params=model.params, tx=adamw
+    #     )
+    # else:
+    #     state = train_state.TrainState.create(
+    #         apply_fn=model.__call__, params=model.params, tx=adamw
+    #     )
+    #     params, opt_state, step = restore_model_checkpoint(training_args.resume_from_checkpoint, state, logger)
+    #     state = state.replace(
+    #         step=step,
+    #         apply_fn=model.__call__,
+    #         params=params,
+    #         tx=adamw,
+    #         opt_state=opt_state,
+    #     )
 
 
     # label smoothed cross entropy
@@ -664,14 +735,16 @@ def main():
         return loss
 
      # Define gradient update step fn
-    def train_step(state, batch, dropout_rng, label_smoothing_factor=0.0):
-        dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
+    # def train_step(state, batch, dropout_rng, label_smoothing_factor=0.0):
+    def train_step(state, batch, label_smoothing_factor=0.0):
+        # dropout_rng, new_dropout_rng = jax.random.split(dropout_rng)
+        dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
 
         def compute_loss(params):
-            # labels = batch.pop("labels")
+            labels = batch.pop("input_ids")
             # masks = batch.pop("attention_mask")
-            labels = batch["input_ids"],
-            logits = state.apply_fn(batch["pixel_values"], batch["input_ids"], batch["attention_mask"], params=params, dropout_rng=dropout_rng, train=True)[0]
+            # labels = batch["input_ids"],
+            logits = state.apply_fn(batch["pixel_values"], batch["decoder_input_ids"], batch["attention_mask"], params=params, dropout_rng=dropout_rng, train=True)[0]
             loss = loss_fn(logits, labels, batch["attention_mask"], label_smoothing_factor)
             return loss
 
@@ -679,23 +752,27 @@ def main():
         loss, grad = grad_fn(state.params)
         grad = jax.lax.pmean(grad, "batch")
 
-        new_state = state.apply_gradients(grads=grad)
+        # new_state = state.apply_gradients(grads=grad)
+        new_state = state.apply_gradients(grads=grad, dropout_rng=new_dropout_rng)
 
         metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
+        gc.collect()
 
-        return new_state, metrics, new_dropout_rng
+        return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch, label_smoothing_factor=0.0):
         labels = batch["input_ids"]
+        # labels = batch.pop("input_ids")
         # masks = batch.pop("attention_mask")
-        logits = model(batch["pixel_values"], batch["input_ids"], batch["attention_mask"], params=params, train=False)[0]
+        logits = model(batch["pixel_values"], batch["decoder_input_ids"], batch["attention_mask"], params=params, train=False)[0]
         loss = loss_fn(logits, labels, batch["attention_mask"], label_smoothing_factor)
 
         # summarize metrics
         metrics = {"loss": loss}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
+        gc.collect()
         return metrics
 
     num_beams = 4  # model has beam size 5, should we keep 4 or 5 here?
@@ -713,8 +790,8 @@ def main():
     p_generate_step = jax.pmap(generate_step, "batch")
 
     # Replicate the train state on each device
-    #state = state.replicate()
-    state = jax_utils.replicate(state)
+    state = state.replicate()
+    # state = jax_utils.replicate(state)
 
     logger.info("***** Running training *****")
     logger.info(f"  Num examples = {len(train_dataset)}")
@@ -733,6 +810,7 @@ def main():
     epochs = tqdm(range(epoch_start_point, num_epochs), desc=f"Epoch:  ({epoch_start_point+1}/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
+        epochs.update(1)
         train_start = time.time()
         train_metrics = []
 
@@ -743,13 +821,14 @@ def main():
 
         epochs.desc = f"Epoch:  ({epoch+1}/{num_epochs})"
 
-        # steps_per_epoch = len(train_dataset) // train_batch_size
+        steps_per_epoch = len(train_dataset) // train_batch_size
 
         train_step_progress_bar = tqdm(total=steps_per_epoch, desc="Training...", position=1, leave=False)
         # train
         for step, batch in enumerate(train_loader):
             batch = shard(batch)
-            state, train_metric, dropout_rngs = p_train_step(state, batch, dropout_rngs)
+            # state, train_metric, dropout_rngs = p_train_step(state, batch, dropout_rngs)
+            state, train_metric = p_train_step(state, batch)
             train_metrics.append(train_metric)
 
             train_step_progress_bar.update(1)
@@ -774,51 +853,61 @@ def main():
                 eval_steps = len(eval_dataset[0])*4 // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
 
                 eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating: ", position=2, leave=False)
-                for lang_eval_loader in eval_loader:
+                for val, lang_eval_loader in enumerate(eval_loader):
 
                     eval_preds = []
                     eval_labels = []
-                    curr_lang = ""
+                    li = ["en_XX", "fr_XX", "es_XX", "de_DE"]
+                    curr_lang = li[val]
 
                     for batch in lang_eval_loader:
                         # Model forward
-                        lang = batch["lang"]
+                        # lang = batch["lang"]
                         batch = shard(batch)
                         labels = batch["input_ids"] # TODO: Check if this works correctly since this is sharded
+                        # print(labels.shape)
 
                         metrics = p_eval_step(state.params, batch)
                         eval_metrics.append(metrics)
 
-                        curr_lang = list(map_lang_num.keys())[lang[0]] # TODO: Check if we can directly replace with lists?
+                        # curr_lang = list(map_lang_num.keys())[lang[0]] # TODO: Check if we can directly replace with lists?
                         # generation
                         if data_args.predict_with_generate:
                             gen_kwargs.update({"decoder_start_token_id": tokenizer.lang_code_to_id[curr_lang]})
                             generated_ids = p_generate_step(state.params, batch)
+                            # print("generated_ids:", generated_ids)
                             eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
                             eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
+
                         eval_step_progress_bar.update(1)
+
 
                     # compute BLEU metrics
                     if data_args.predict_with_generate:
                         bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
-                        # print(bleu_metrics)
                         bleu_metrics_total[curr_lang] = bleu_metrics
+                        gc.collect()
+
+                    gc.collect()
 
                 # normalize eval metrics
                 eval_metrics = get_metrics(eval_metrics)
                 eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                eval_metrics.update(bleu_metrics_total)
-                bleu_desc = " ".join([f"BLEU score {key}: {value} |" for key, value in bleu_metrics_total.items()])
+                # eval_metrics.update(bleu_metrics_total)
+                # bleu_desc = " ".join([f"BLEU score {key}: {value} |" for key, value in bleu_metrics_total.items()])
 
                 # Print metrics and update progress bar
                 eval_step_progress_bar.close()
-                epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']} | {bleu_desc})")
-                # epochs.desc = desc
+                # epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']} | {bleu_desc})")
+                epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']})")
+
 
                 # Save metrics
                 if has_tensorboard and jax.process_index() == 0:
                     write_eval_metric(summary_writer, eval_metrics, cur_step)
+
+                eval_metrics = []
 
             if cur_step % training_args.save_steps == 0 and cur_step > 0:
                 # save checkpoint after each epoch and push checkpoint to the hub
@@ -831,16 +920,22 @@ def main():
                     #     commit_message=f"Saving weights and logs of step {cur_step}",
                     # )
                     save_model_checkpoint(model, training_args.output_dir, state, logger, training_args.push_to_hub_organization, with_opt=True, push_to_hub=training_args.push_to_hub, overwrite=True)
+                    gc.collect()
                     # if model_args.save_optimizer:
                     #     # this saves full state including optimizer
                     #     save_checkpoint(training_args.output_dir, state, state.step, keep=training_args.save_total_limit, overwrite=True)
                     if training_args.save_total_limit is not None:
                         rotate_checkpoints(training_args.output_dir, training_args.save_total_limit, logger)
-            train_step_progress_bar.close()
-            epochs.update(1)
+                        # gc.collect()
+
+
             if cur_step==total_train_steps:
                 break_all=True
                 break
+
+        train_step_progress_bar.close()
+        # gc.collect()
+
         if break_all:
             break
 
