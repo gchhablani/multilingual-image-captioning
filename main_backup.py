@@ -35,8 +35,6 @@ from flax.training.common_utils import get_metrics, shard, shard_prng_key, get_m
 from models.flax_clip_vision_mbart.modeling_clip_vision_mbart import FlaxCLIPVisionMBartForConditionalGeneration
 from transformers import MBart50TokenizerFast, HfArgumentParser, TrainingArguments, is_tensorboard_available, set_seed
 
-from PIL import ImageFile
-ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 logger = logging.getLogger(__name__)
 
@@ -112,11 +110,11 @@ class DataTrainingArguments:
         metadata={"help": "The data directory containing input files."}
     )
     train_file: Optional[str] = field(
-        default=None,  # TODO
+        default="/home/user/data/CC12M/val_file.tsv",  # TODO
         metadata={"help": "The input training data file (a jsonlines file)."}
     )
     validation_file: Optional[str] = field(
-        default=None,  # TODO
+        default="/home/user/data/CC12M/val_file.tsv",  # TODO
         metadata={"help": "An optional input evaluation data file (a jsonlines file)."},
     )
     max_seq_length: Optional[int] = field(
@@ -191,9 +189,9 @@ class ImageTextDataset(VisionDataset):
     ):
         super().__init__(root, transforms, transform, target_transform)
 
-        self.captions = []
-        self.image_paths = []
-        self.lang = []
+        # self.captions = []
+        # self.image_paths = []
+        # self.lang = []
 
         examples = pd.read_csv(file_path, sep='\t')
         gc.collect()
@@ -205,12 +203,15 @@ class ImageTextDataset(VisionDataset):
             "es": "es_XX",
         }
 
-        for idx,img_file in enumerate(examples["image_file"].values):
-            if os.path.exists(os.path.join(self.root,img_file)):
-                self.image_paths.append(img_file)
-                self.captions.append(examples["caption"].values[idx])
-                self.lang.append(examples["lang_id"].values[idx])
+        # for idx,img_file in enumerate(examples["image_file"].values):
+        #     if os.path.exists(os.path.join(self.root,img_file)):
+        #     self.image_paths.append(img_file)
+        #     self.captions.append(examples["caption"].values[idx])
+        #     self.lang.append(examples["lang_id"].values[idx])
 
+        self.image_paths = examples["image_file"].values
+        self.captions = examples["caption"].values
+        self.lang = examples["lang_id"].values
 
         if max_samples is None:
             max_samples = len(self.image_paths)
@@ -218,6 +219,13 @@ class ImageTextDataset(VisionDataset):
         self.image_paths = self.image_paths[:max_samples]
         self.captions = self.captions[:max_samples]
         self.lang = self.lang[:max_samples]
+
+        # with open(file_path, encoding="utf-8") as fd:
+        #     examples = csv.DictReader(fd, delimiter="\t", quotechar='"')
+        #     for row in examples:
+        #         self.image_paths.append(os.path.join(self.root,row["image_file"]))
+        #         self.captions.append(row["caption"])
+        #         self.lang.append(row["lang_id"])
 
 
     def _load_image(self, idx: int):
@@ -368,7 +376,6 @@ def shift_tokens_right(input_ids: np.array, pad_token_id: int):
     shifted_input_ids[:, 0] = pad_token_id
     return shifted_input_ids
 
-
 def main():
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
 
@@ -416,6 +423,20 @@ def main():
         "fr_XX": "french",
         "es_XX": "spanish",
     }
+
+    # if model_args.tokenizer_name:
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         model_args.tokenizer_name, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
+    #     )
+    # elif model_args.text_model_name_or_path:
+    #     tokenizer = AutoTokenizer.from_pretrained(
+    #         model_args.text_model_name_or_path, cache_dir=model_args.cache_dir, use_fast=model_args.use_fast_tokenizer
+    #     )
+    # else:
+    #     raise ValueError(
+    #         "You are instantiating a new tokenizer from scratch. This is not supported by this script."
+    #         "You can do it from another script, save it, and load it from here, using --tokenizer_name."
+    #     )
 
     if training_args.resume_from_checkpoint is None:
         model = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained(
@@ -465,7 +486,6 @@ def main():
         val_paths.append(os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file)))
 
     logger.info(f"creating eval dataset from ImageTextDataset")
-    # gc.collect()
 
     eval_dataset = []
     for i in range(len(lang_list)):
@@ -488,21 +508,14 @@ def main():
 
     logger.info(f"initialising shift tokens right from model")
 
-
-    # Use collate function to tokenizer the text and convert the processed images to numpy
-    def collate_fn(examples):
-        pixel_values = torch.stack([example[0] for example in examples]).permute(0, 2, 3, 1).numpy()
-        captions = [example[1] for example in examples]
-        lang_id = [example[2] for example in examples]
-
-        # inputs = helper_collate(lang_id, captions)
+    def helper_collate(lang_id, captions):
         inputs = {}
 
         for num, (lang,caption) in enumerate(zip(lang_id,captions)):
             # tokenizer = map_tokenizer_lang[lang]
             tokenizer.tgt_lang = lang
             with tokenizer.as_target_tokenizer():
-                tokens = tokenizer(str(caption), max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+                tokens = tokenizer(caption, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
             if num==0:
                 inputs["input_ids"] = tokens["input_ids"]
                 inputs["attention_mask"] = tokens["attention_mask"]
@@ -510,6 +523,19 @@ def main():
                 inputs["input_ids"] = np.concatenate([inputs["input_ids"], tokens["input_ids"]])
                 inputs["attention_mask"] = np.concatenate([inputs["attention_mask"], tokens["attention_mask"]])
 
+        return inputs
+
+
+    # Use collate function to tokenizer the text and convert the processed images to numpy
+    def collate_fn(examples):
+        pixel_values = torch.stack([example[0] for example in examples]).permute(0, 2, 3, 1).numpy()
+        captions = [example[1] for example in examples]
+        lang_id = [example[2] for example in examples]
+
+        inputs = helper_collate(lang_id, captions)
+
+        # had to create another enum of sorts for lang_id
+        # lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
 
         decoder_input_ids = shift_tokens_right(inputs["input_ids"], config.mbart_config.pad_token_id)
 
@@ -518,6 +544,7 @@ def main():
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
             "decoder_input_ids": decoder_input_ids,
+            # "lang": lang_id,
         }
 
         return batch
@@ -532,6 +559,8 @@ def main():
         with tokenizer.as_target_tokenizer():
             tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
 
+        # had to create another enum of sorts for lang_id
+        # lang_id = np.array([map_lang_num[lang] for lang in lang_id])  # str of type <class 'numpy.ndarray'> is not a valid JAX type
         decoder_input_ids = shift_tokens_right(tokens["input_ids"], config.mbart_config.pad_token_id)
 
         batch = {
@@ -539,6 +568,7 @@ def main():
             "input_ids": tokens["input_ids"],
             "attention_mask": tokens["attention_mask"],
             "decoder_input_ids": decoder_input_ids,
+            # "lang": lang_id,
         }
         return batch
 
@@ -550,7 +580,7 @@ def main():
         batch_size=train_batch_size,
         shuffle=True,
         num_workers=data_args.preprocessing_num_workers,
-        # persistent_workers=True,
+        persistent_workers=True,
         drop_last=True,
         collate_fn=collate_fn,
     )
@@ -564,7 +594,7 @@ def main():
             batch_size=eval_batch_size,
             shuffle=False,
             num_workers=data_args.preprocessing_num_workers,
-            # persistent_workers=True,
+            persistent_workers=True,
             drop_last=True,
             collate_fn=collate_fn_val,
         )
@@ -572,7 +602,7 @@ def main():
 
     # Metric
     metric = load_metric("bleu")
-    gc.collect()
+    # gc.collect()
 
     def postprocess_text(preds, labels, lang):
         preds = [pred.strip() for pred in preds]
@@ -689,9 +719,9 @@ def main():
         dropout_rng, new_dropout_rng = jax.random.split(state.dropout_rng)
 
         def compute_loss(params):
-            labels = batch.pop("input_ids")
+            # labels = batch.pop("labels")
             # masks = batch.pop("attention_mask")
-            # labels = batch["input_ids"],
+            labels = batch["input_ids"],
             logits = state.apply_fn(batch["pixel_values"], batch["decoder_input_ids"], batch["attention_mask"], params=params, dropout_rng=dropout_rng, train=True)[0]
             loss = loss_fn(logits, labels, batch["attention_mask"], label_smoothing_factor)
             return loss
@@ -705,14 +735,12 @@ def main():
 
         metrics = {"loss": loss, "learning_rate": linear_decay_lr_schedule_fn(state.step)}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
-        gc.collect()
 
         return new_state, metrics
 
     # Define eval fn
     def eval_step(params, batch, label_smoothing_factor=0.0):
         labels = batch["input_ids"]
-        # labels = batch.pop("input_ids")
         # masks = batch.pop("attention_mask")
         logits = model(batch["pixel_values"], batch["decoder_input_ids"], batch["attention_mask"], params=params, train=False)[0]
         loss = loss_fn(logits, labels, batch["attention_mask"], label_smoothing_factor)
@@ -720,18 +748,18 @@ def main():
         # summarize metrics
         metrics = {"loss": loss}
         metrics = jax.lax.pmean(metrics, axis_name="batch")
-        gc.collect()
         return metrics
 
     num_beams = 4  # model has beam size 5, should we keep 4 or 5 here?
     gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
     def generate_step(params, batch):
-        output_ids = model.generate(batch["pixel_values"], params=params, **gen_kwargs)
+        model.params = params
+        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
-    p_train_step = jax.pmap(partial(train_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch", donate_argnums=(0,1,2,))
+    p_train_step = jax.pmap(partial(train_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch", donate_argnums=(0,))
 
     p_eval_step = jax.pmap(partial(eval_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch")
     p_generate_step = jax.pmap(generate_step, "batch")
@@ -828,7 +856,6 @@ def main():
 
                         eval_step_progress_bar.update(1)
 
-
                     # compute BLEU metrics
                     if data_args.predict_with_generate:
                         bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
@@ -847,8 +874,7 @@ def main():
                 # Print metrics and update progress bar
                 eval_step_progress_bar.close()
                 epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']} | {bleu_desc})")
-                # epochs.write(f"Eval at Step: {cur_step} (Eval Loss: {eval_metrics['loss']})")
-
+                # epochs.desc = desc
 
                 # Save metrics
                 if has_tensorboard and jax.process_index() == 0:
@@ -881,8 +907,7 @@ def main():
                 break
 
         train_step_progress_bar.close()
-        epochs.update(1)
-        gc.collect()
+        # gc.collect()
 
         if break_all:
             break
