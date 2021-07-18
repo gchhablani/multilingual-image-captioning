@@ -32,8 +32,8 @@ from flax import jax_utils, traverse_util
 from flax.jax_utils import unreplicate
 from flax.training import train_state
 from flax.training.common_utils import get_metrics, shard, shard_prng_key, get_metrics, onehot
-from models.flax_clip_vision_marian.modeling_clip_vision_marian import FlaxCLIPVisionMarianMT
-from transformers import MarianTokenizer, HfArgumentParser, TrainingArguments, is_tensorboard_available, set_seed
+from models.flax_clip_vision_mbart.modeling_clip_vision_mbart import FlaxCLIPVisionMBartForConditionalGeneration
+from transformers import MBart50TokenizerFast, HfArgumentParser, TrainingArguments, is_tensorboard_available, set_seed
 
 from PIL import ImageFile
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -72,7 +72,7 @@ class ModelArguments:
         },
     )
     text_model_name_or_path: str = field(
-        default = 'Helsinki-NLP/opus-mt-en-es',
+        default = 'facebook/mbart-large-50',
         metadata={
             "help": "The text model checkpoint for weights initialization."
             "Don't set if you want to train a model from scratch."
@@ -83,8 +83,8 @@ class ModelArguments:
     #     metadata={"help": "whether to load the text using PyTorch checkpoints."},
     # )
 
-    marian_tokenizer_name: Optional[str] = field(
-        default="Helsinki-NLP/opus-mt-en-es", metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
+    mbart_tokenizer_name: Optional[str] = field(
+        default="facebook/mbart-large-50", metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
@@ -112,11 +112,11 @@ class DataTrainingArguments:
         metadata={"help": "The data directory containing input files."}
     )
     train_file: Optional[str] = field(
-        default=None,
+        default=None,  # TODO
         metadata={"help": "The input training data file (a jsonlines file)."}
     )
     validation_file: Optional[str] = field(
-        default=None,
+        default=None,  # TODO
         metadata={"help": "An optional input evaluation data file (a jsonlines file)."},
     )
     max_seq_length: Optional[int] = field(
@@ -133,7 +133,7 @@ class DataTrainingArguments:
             "value if set."
         },
     )
-    max_eval_samples: Optional[int] = field(
+    max_eval_samples_per_lang: Optional[int] = field(
         default=None,
         metadata={
             "help": "For debugging purposes or quicker training, truncate the number of evaluation examples to this "
@@ -193,24 +193,31 @@ class ImageTextDataset(VisionDataset):
 
         self.captions = []
         self.image_paths = []
+        self.lang = []
 
         examples = pd.read_csv(file_path, sep='\t')
         gc.collect()
+
+        self.map_lang_code = {
+            "en": "en_XX",
+            "de": "de_DE",
+            "fr": "fr_XX",
+            "es": "es_XX",
+        }
 
         for idx,img_file in enumerate(examples["image_file"].values):
             if os.path.exists(os.path.join(self.root,img_file)):
                 self.image_paths.append(img_file)
                 self.captions.append(examples["caption"].values[idx])
+                self.lang.append(examples["lang_id"].values[idx])
 
-        # self.image_paths = examples["image_file"].values
-        # self.captions = examples["caption"].values
-        # self.lang = examples["lang_id"].values
 
         if max_samples is None:
             max_samples = len(self.image_paths)
 
         self.image_paths = self.image_paths[:max_samples]
         self.captions = self.captions[:max_samples]
+        self.lang = self.lang[:max_samples]
 
 
     def _load_image(self, idx: int):
@@ -220,14 +227,19 @@ class ImageTextDataset(VisionDataset):
     def _load_target(self, idx):
         return self.captions[idx]
 
+    def _load_lang(self, idx):
+        return self.lang[idx]
+
     def __getitem__(self, index: int):
         image = self._load_image(index)
         target = self._load_target(index)
+        lang = self._load_lang(index)
+        lang = self.map_lang_code[lang]
 
         if self.transforms is not None:
             image, target = self.transforms(image, target)
 
-        return image, target
+        return image, target, lang
 
     def __len__(self) -> int:
         return len(self.captions)
@@ -347,7 +359,7 @@ def rotate_checkpoints(ckpt_dir:str, save_total_limit:int, logger):
 # In Flax, for seq2seq models we need to pass `decoder_input_ids`
 # as the Flax models don't accept `labels`, we need to prepare the decoder_input_ids here
 # for that dynamically import the `shift_tokens_right` function from the model file
-def shift_tokens_right(input_ids: np.array, pad_token_id: int):  # TODO would this be required?
+def shift_tokens_right(input_ids: np.array, pad_token_id: int):
     """
     Shift input ids one token to the right.
     """
@@ -389,17 +401,32 @@ def main():
     # Set the verbosity to info of the Transformers logger (on main process only):
     logger.info(f"Training/evaluation parameters {training_args}")
 
-    tokenizer = MarianTokenizer.from_pretrained(model_args.marian_tokenizer_name)
+    tokenizer = MBart50TokenizerFast.from_pretrained(model_args.mbart_tokenizer_name)
+
+    map_lang_num = {
+        "en_XX": 0,
+        "de_DE": 1,
+        "fr_XX": 2,
+        "es_XX": 3,
+    }
+
+    map_bart_nltk = {
+        "en_XX": "english",
+        "de_DE": "german",
+        "fr_XX": "french",
+        "es_XX": "spanish",
+    }
 
     if training_args.resume_from_checkpoint is None:
-        model = FlaxCLIPVisionMarianMT.from_clip_vision_marian_pretrained(
+        model = FlaxCLIPVisionMBartForConditionalGeneration.from_clip_vision_mbart_pretrained(
             model_args.vision_model_name_or_path,
             model_args.text_model_name_or_path,
             seed=training_args.seed,
             dtype=getattr(jnp, model_args.dtype),
+            mbart_from_pt=True
         )
     else:
-        model = FlaxCLIPVisionMarianMT.from_clip_vision_marian_pretrained(training_args.resume_from_checkpoint)
+        model = FlaxCLIPVisionMBartForConditionalGeneration.from_pretrained(training_args.resume_from_checkpoint)
     config = model.config
     # config = vision_model_name_or_path.config
     # set seed for torch dataloaders
@@ -421,14 +448,36 @@ def main():
         max_samples = data_args.max_train_samples
     )
 
-    logger.info(f"creating eval dataset from ImageTextDataset")
+    _df = pd.read_csv(data_args.validation_file, delimiter="\t", index_col=False)
+    gc.collect()
+    lang_list = ["en", "fr", "es", "de"]
 
-    eval_dataset = ImageTextDataset(
-        data_args.data_dir,
-        data_args.validation_file,
-        transform=preprocess,
-        max_samples=data_args.max_eval_samples
-    )
+    logger.info(f"Splitting validations TSVs")
+
+    for i in lang_list:  # splits validation file into 4 subsets
+        subset_lang_tsv = _df[_df["lang_id"]==i]
+        subset_lang_tsv.reset_index(drop=True, inplace=True)
+        path = os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file))
+        subset_lang_tsv.to_csv(path, index=False, sep="\t")
+
+    val_paths = []
+    for i in lang_list:
+        val_paths.append(os.path.join(os.path.dirname(data_args.validation_file), f"{i}_"+os.path.basename(data_args.validation_file)))
+
+    logger.info(f"creating eval dataset from ImageTextDataset")
+    # gc.collect()
+
+    eval_dataset = []
+    for i in range(len(lang_list)):
+        dataset = ImageTextDataset(
+            data_args.data_dir,
+            val_paths[i],
+            transform=preprocess,
+            max_samples=data_args.max_eval_samples_per_lang
+        )
+        eval_dataset.append(dataset)
+
+    gc.collect()
 
     # Store some constant
     num_epochs = int(training_args.num_train_epochs)
@@ -443,12 +492,48 @@ def main():
     # Use collate function to tokenizer the text and convert the processed images to numpy
     def collate_fn(examples):
         pixel_values = torch.stack([example[0] for example in examples]).permute(0, 2, 3, 1).numpy()
-        captions = [str(example[1]) for example in examples]
+        captions = [example[1] for example in examples]
+        lang_id = [example[2] for example in examples]
 
+        # inputs = helper_collate(lang_id, captions)
+        inputs = {}
+
+        for num, (lang,caption) in enumerate(zip(lang_id,captions)):
+            # tokenizer = map_tokenizer_lang[lang]
+            tokenizer.tgt_lang = lang
+            with tokenizer.as_target_tokenizer():
+                tokens = tokenizer(str(caption), max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
+            if num==0:
+                inputs["input_ids"] = tokens["input_ids"]
+                inputs["attention_mask"] = tokens["attention_mask"]
+            else:
+                inputs["input_ids"] = np.concatenate([inputs["input_ids"], tokens["input_ids"]])
+                inputs["attention_mask"] = np.concatenate([inputs["attention_mask"], tokens["attention_mask"]])
+
+
+        decoder_input_ids = shift_tokens_right(inputs["input_ids"], config.mbart_config.pad_token_id)
+
+        batch = {
+            "pixel_values": pixel_values,
+            "input_ids": inputs["input_ids"],
+            "attention_mask": inputs["attention_mask"],
+            "decoder_input_ids": decoder_input_ids,
+        }
+
+        return batch
+
+    def collate_fn_val(examples):
+        pixel_values = torch.stack([example[0] for example in examples]).permute(0, 2, 3, 1).numpy()
+        captions = [example[1] for example in examples]
+        lang_id = [example[2] for example in examples]
+
+        # tokenizer = map_tokenizer_lang[lang_id[0]]
+        tokenizer.tgt_lang = lang_id[0]  # every validation loader has same language
         with tokenizer.as_target_tokenizer():
             tokens = tokenizer(captions, max_length=data_args.max_seq_length, padding="max_length", return_tensors="np", truncation=True)
 
-        decoder_input_ids = shift_tokens_right(tokens["input_ids"], config.marian_config.pad_token_id)
+        decoder_input_ids = shift_tokens_right(tokens["input_ids"], config.mbart_config.pad_token_id)
+
         batch = {
             "pixel_values": pixel_values,
             "input_ids": tokens["input_ids"],
@@ -472,41 +557,42 @@ def main():
 
     logger.info(f"Creating eval data loader")
 
-    eval_loader = torch.utils.data.DataLoader(
-        eval_dataset,
-        batch_size=eval_batch_size,
-        shuffle=False,
-        num_workers=data_args.preprocessing_num_workers,
-        # persistent_workers=True,
-        drop_last=True,
-        collate_fn=collate_fn,
-    )
+    eval_loader = []
+    for i in range(len(lang_list)):
+        loader = torch.utils.data.DataLoader(
+            eval_dataset[i],
+            batch_size=eval_batch_size,
+            shuffle=False,
+            num_workers=data_args.preprocessing_num_workers,
+            # persistent_workers=True,
+            drop_last=True,
+            collate_fn=collate_fn_val,
+        )
+        eval_loader.append(loader)
 
     # Metric
     metric = load_metric("bleu")
+    gc.collect()
 
-    def postprocess_text(preds, labels):
+    def postprocess_text(preds, labels, lang):
         preds = [pred.strip() for pred in preds]
         labels = [label.strip() for label in labels]
 
-        preds = [nltk.word_tokenize(pred, language="spanish") for pred in preds]
+        preds = [nltk.word_tokenize(pred, language=lang) for pred in preds]
 
         # put in another list as seen https://github.com/huggingface/datasets/blob/256156b29ce2f4bb1ccedce0638491e440b0d1a2/metrics/bleu/bleu.py#L82
-        labels = [[nltk.word_tokenize(label, language="spanish")] for label in labels]
+        labels = [[nltk.word_tokenize(label, language=lang)] for label in labels]
 
         gc.collect()
         return preds, labels
 
-    def compute_metrics(preds, labels):  # make sure it's working correctly
-
-        # print(preds)
+    def compute_metrics(preds, labels, lang):
 
         decoded_preds = tokenizer.batch_decode(preds, skip_special_tokens=True, max_length=64)
         decoded_labels = tokenizer.batch_decode(labels, skip_special_tokens=True, max_length=64)
-        # print(decoded_preds)
 
         # Some simple post-processing
-        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels)
+        decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels, map_bart_nltk[lang])
 
         result = {}
         for i in range(1,5):
@@ -635,7 +721,7 @@ def main():
         return metrics
 
     num_beams = 4  # model has beam size 5, should we keep 4 or 5 here?
-    gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams, "early_stopping": True}
+    gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
     def generate_step(params, batch):
         model.params = params
@@ -643,7 +729,7 @@ def main():
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
-    p_train_step = jax.pmap(partial(train_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch", donate_argnums=(0,))
+    p_train_step = jax.pmap(partial(train_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch", donate_argnums=(0,1,2,))
 
     p_eval_step = jax.pmap(partial(eval_step, label_smoothing_factor=training_args.label_smoothing_factor), "batch")
     p_generate_step = jax.pmap(generate_step, "batch")
@@ -701,42 +787,49 @@ def main():
                 epochs.write(f"Log at Step: {cur_step} (Loss: {train_metric['loss']}, Learning Rate: {train_metric['learning_rate']})")
 
                 train_metrics = [] # TODO: Check why is this being done? WHat is this needed for?
-                gc.collect()
 
             if cur_step % training_args.eval_steps == 0 and cur_step > 0:
 
                 eval_metrics = []
-                eval_preds = []
-                eval_labels = []
                 bleu_metrics_total = {}
 
                 # TODO: Check if this is correct
-                eval_steps = len(eval_dataset) // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
+                eval_steps = len(eval_dataset[0])*4 // eval_batch_size  # eval_dataset is a list containing loaders for diff langs
 
                 eval_step_progress_bar = tqdm(total=eval_steps, desc="Evaluating: ", position=2, leave=False)
-                for batch in eval_loader:
-                    # Model forward
-                    # lang = batch["lang"]
-                    batch = shard(batch)
-                    labels = batch["input_ids"] # TODO: Check if this works correctly since this is sharded
+                for val, lang_eval_loader in enumerate(eval_loader):
+
+                    eval_preds = []
+                    eval_labels = []
+                    li = ["en_XX", "fr_XX", "es_XX", "de_DE"]
+                    curr_lang = li[val]
+
+                    for batch in lang_eval_loader:
+                        # Model forward
+                        # lang = batch["lang"]
+                        batch = shard(batch)
+                        labels = batch["input_ids"] # TODO: Check if this works correctly since this is sharded
                         # print(labels.shape)
 
-                    metrics = p_eval_step(state.params, batch)
-                    eval_metrics.append(metrics)
+                        metrics = p_eval_step(state.params, batch)
+                        eval_metrics.append(metrics)
 
-                    if data_args.predict_with_generate:
-                        generated_ids = p_generate_step(state.params, batch)
-                        # print("generated_ids:", generated_ids)
-                        eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
-                        eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
+                        # curr_lang = list(map_lang_num.keys())[lang[0]] # TODO: Check if we can directly replace with lists?
+                        # generation
+                        if data_args.predict_with_generate:
+                            gen_kwargs.update({"decoder_start_token_id": tokenizer.lang_code_to_id[curr_lang]})
+                            generated_ids = p_generate_step(state.params, batch)
+                            # print("generated_ids:", generated_ids)
+                            eval_preds.extend(jax.device_get(generated_ids.reshape(-1, gen_kwargs["max_length"])))
+                            eval_labels.extend(jax.device_get(labels.reshape(-1, labels.shape[-1])))
 
-                    eval_step_progress_bar.update(1)
+                        eval_step_progress_bar.update(1)
 
 
                     # compute BLEU metrics
                     if data_args.predict_with_generate:
-                        bleu_metrics = compute_metrics(eval_preds, eval_labels)  # eval_langs would contain one lang only
-                        bleu_metrics_total["es"] = bleu_metrics
+                        bleu_metrics = compute_metrics(eval_preds, eval_labels, curr_lang)  # eval_langs would contain one lang only
+                        bleu_metrics_total[curr_lang] = bleu_metrics
                         gc.collect()
 
                     gc.collect()
@@ -745,7 +838,7 @@ def main():
                 eval_metrics = get_metrics(eval_metrics)
                 eval_metrics = jax.tree_map(jnp.mean, eval_metrics)
 
-                eval_metrics.update(bleu_metrics)
+                eval_metrics.update(bleu_metrics_total)
                 bleu_desc = " ".join([f"BLEU score {key}: {value} |" for key, value in bleu_metrics_total.items()])
 
                 # Print metrics and update progress bar
@@ -785,8 +878,8 @@ def main():
                 break
 
         train_step_progress_bar.close()
-        # gc.collect()
         epochs.update(1)
+        gc.collect()
 
         if break_all:
             break
