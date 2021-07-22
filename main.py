@@ -594,9 +594,6 @@ def main():
         # Some simple post-processing
         decoded_preds, decoded_labels = postprocess_text(decoded_preds, decoded_labels, map_bart_nltk[lang])
 
-        # print(decoded_preds)
-        # print(len(decoded_preds), len(decoded_labels))
-
         result = {}
         for i in range(1,5):
             tmp = metric.compute(predictions=decoded_preds, references=decoded_labels, max_order=i)
@@ -672,7 +669,7 @@ def main():
             confidence * jnp.log(confidence) + (vocab_size - 1) * low_confidence * jnp.log(low_confidence + 1e-20)
         )
 
-        soft_labels = onehot(labels[0], vocab_size, on_value=confidence, off_value=low_confidence)
+        soft_labels = onehot(labels, vocab_size, on_value=confidence, off_value=low_confidence)
 
         loss = optax.softmax_cross_entropy(logits, soft_labels)
         loss = loss - normalizing_constant
@@ -727,7 +724,8 @@ def main():
     gen_kwargs = {"max_length": data_args.max_seq_length, "num_beams": num_beams}
 
     def generate_step(params, batch):
-        output_ids = model.generate(batch["pixel_values"], params=params, **gen_kwargs)
+        model.params = params
+        output_ids = model.generate(batch["pixel_values"], **gen_kwargs)
         return output_ids.sequences
 
     # Create parallel version of the train and eval step
@@ -757,7 +755,6 @@ def main():
     epochs = tqdm(range(epoch_start_point, num_epochs), desc=f"Epoch:  ({epoch_start_point+1}/{num_epochs})", position=0)
     for epoch in epochs:
         # ======================== Training ================================
-        epochs.update(1)
         train_start = time.time()
         train_metrics = []
 
