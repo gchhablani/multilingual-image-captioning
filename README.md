@@ -196,7 +196,7 @@ A slightly (not-so) long term use case would definitely be, explaining what happ
       primaryClass={cs.CV}
 }
 ```
-```
+
 ### Useful Links
 - [Conceptual 12M Dataset](https://github.com/google-research-datasets/conceptual-12m)
   
