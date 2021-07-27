@@ -24,9 +24,8 @@ GitHub Repository for Multilingual Image Captioning task created during HuggingF
   - [Novel Contributions](#novel-contributions)
 - [Methodology](#methodology)
   - [Pre-training](#pre-training)
-    - MLM Dataset
-    - MLM Model
-    - MLM Training Logs
+    - Dataset
+    - Model
 - [Challenges and Technical Difficulties](#challenges-and-technical-difficulties)
 - [Limitations and Bias](#limitations-and-bias)
   - [Limitations](#limitations)
