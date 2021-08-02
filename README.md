@@ -2,16 +2,17 @@
 <img src='./mic-logo.png' width=400/>
 </p>
 
-# Multilingual Image Captioning
+# Multilingual Image Captioning 
 
-Authors: **Bhavitvya Malik**, **Gunjan Chhablani**  [Demo](https://huggingface.co/spaces/flax-community/multilingual-image-captioning)
+Authors: **Bhavitvya Malik**, **Gunjan Chhablani**
+</br>
+Demo Link: https://huggingface.co/spaces/flax-community/multilingual-image-captioning
 
 GitHub Repository for Multilingual Image Captioning task created during HuggingFace JAX/Flax community week. Multilingual Image Captioning addresses the challenge of caption generation for an image in a multilingual setting. Here, we fuse CLIP Vision transformer into mBART50 and perform training on translated version of Conceptual-12M dataset.
 
 - Our models are present in the `models` directory. We have combined CLIP Vision+mBART-50 in the model repository.
 - Our training scripts are:
   - `run.sh` for pre-training.
-
 
 ## Usage:
 - Install the `requirements.txt` file in your environment.
@@ -48,16 +49,14 @@ output_string  # Un restaurante u otro lugar para comer en el Hotel
 - [Challenges and Technical Difficulties](#challenges-and-technical-difficulties)
 - [Limitations and Bias](#limitations-and-bias)
   - [Limitations](#limitations)
-  - [Bias](#bias)
+  - [Biases](#biases)
 - [Conclusion, Future Work, and Social Impact](#conclusion-future-work-and-social-impact)
   - [Conclusion](#conclusion)
-  - [Future Work](#future-work)
+  - [Future Work](#future-scope)
   - [Social Impact](#social-impact)
 - [References](#references)
   - [Papers](#papers)
   - [Useful Links](#useful-links)
-- [Checkpoints](#checkpoints)
-  - [Other Checkpoints](#other-checkpoints)
 - [Acknowledgements](#acknowledgements)
 
 ## Introduction and Motivation
@@ -111,11 +110,11 @@ Training image captioning that too multilingual was a difficult task and we face
 - The dataset has all `Person` type named entites masked as `<PERSON>`. While that is good for biases as we explain below, the dataset contains too many `<PERSON>` tags and the model results in `<PERSON><PERSON><PERSON>` sometimes for Person-related images.
 - Our captions are sometimes generic. Stating what is present in the image instead of generation well-formed and convoluted captions. Despite the training, the BLEU scores we achieve are not very great, which could be a reason for this. With higher BLEU scores, we can expect less-generic models.
 - English captions are sometimes better than other languages. This can be due to the fact that we limit sequence length of other languages to 64 (and now 128) while English text works fine. This could also be due to poor-quality translations which we wish to address in our next attempt.
--
-### Biases
-Due to the gender, racial, color and stereotypical biases in data, person identification by an image captioning model suffers. Also, the gender-activity bias, owing to the word-by-word prediction, influences other words in the caption prediction, resulting in the well-known problem of label bias.
 
-One of the reasons why we chose Conceptual 12M over COCO captioning dataset for training our Multi-lingual Image Captioning model was that in former all named entities of type Person were substituted by a special token <PERSON>. Because of this, the gendered terms in our captions became quite infrequent. We'll present a few captions from our model to analyse how our model performed on different images on which different pre-trained image captioning model usually gives gender prediction biases.
+### Biases
+- Due to the gender, racial, color and stereotypical biases in data, person identification by an image captioning model suffers. Also, the gender-activity bias, owing to the word-by-word prediction, influences other words in the caption prediction, resulting in the well-known problem of label bias.
+
+- One of the reasons why we chose Conceptual 12M over COCO captioning dataset for training our Multi-lingual Image Captioning model was that in former all named entities of type Person were substituted by a special token <PERSON>. Because of this, the gendered terms in our captions became quite infrequent. We'll present a few captions from our model to analyse how our model performed on different images on which different pre-trained image captioning model usually gives gender prediction biases.
 
 ## Conclusion, Future Work, and Social Impact
 ### Conclusion
