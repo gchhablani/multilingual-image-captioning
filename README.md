@@ -4,11 +4,11 @@
 
 # Multilingual Image Captioning
 
-Authors: **Bhavitvya Malik**, **Gunjan Chhablani**
+Authors: **Bhavitvya Malik**, **Gunjan Chhablani**  [Demo](https://huggingface.co/spaces/flax-community/multilingual-image-captioning)
 
 GitHub Repository for Multilingual Image Captioning task created during HuggingFace JAX/Flax community week. Multilingual Image Captioning addresses the challenge of caption generation for an image in a multilingual setting. Here, we fuse CLIP Vision transformer into mBART50 and perform training on translated version of Conceptual-12M dataset.
 
-- Our models are present in the `models` directory. We have combined CLIP Vision+mBART-50 in the model repository. 
+- Our models are present in the `models` directory. We have combined CLIP Vision+mBART-50 in the model repository.
 - Our training scripts are:
   - `run.sh` for pre-training.
 
@@ -18,6 +18,25 @@ GitHub Repository for Multilingual Image Captioning task created during HuggingF
 - To run a training script, just use your command line:
 ```sh
 ./run.sh
+```
+- Inference (You will need to clone the model from here as well):
+```python
+from torchvision.io import read_image
+import numpy as  np
+import os, wget
+from transformers import CLIPProcessor, MBart50TokenizerFast
+from model.flax_clip_vision_mbart.modeling_clip_vision_mbart import FlaxCLIPVisionMBartForConditionalGeneration
+img = wget("http://images.cocodataset.org/val2017/000000397133.jpg")
+img = read_image(img) # reading image
+clip_processor = CLIPProcessor.from_pretrained('openai/clip-vit-base-patch32')
+clip_outputs = clip_processor(images=img)
+clip_outputs['pixel_values'][0] = clip_outputs['pixel_values'][0].transpose(1,2,0) # Need to transpose images as model expected channel last images.
+tokenizer = MBart50TokenizerFast.from_pretrained('facebook/mbart-large-50"')
+model = FlaxCLIPVisionBertForMaskedLM.from_pretrained('flax-community/clip-vit-base-patch32_mbart-large-50')
+output_ids = model.generate(batch["pixel_values"], forced_bos_token_id=tokenizer.lang_code_to_id["es_XX"], num_beams=4, max_length=64).sequences  # "es_XX is the language code in which you want the translation
+# en_XX: English, fr_XX: French, es_XX: Spanish, de_DE: Deutsch
+output_string = tokenizer.batch_decode(output_ids.reshape(-1, 64), skip_special_tokens=True, max_length=64)
+output_string  # Un restaurante u otro lugar para comer en el Hotel
 ```
 ## Table of Contents
 - [Introduction and Motivation](#introduction-and-motivation)
@@ -59,7 +78,7 @@ We follow an encoder-decoder approach for image captioning, where the image enco
 <p align="center">
 <img src='./Multilingual-IC.png' width=500/>
 </p>
-  
+
 **Dataset**
 The dataset we use for pre-training is a cleaned version of Conceptual 12M. The dataset is downloaded and then broken images are removed which gives us about 10M images. To save time, we use 2.5M of these image-text pairs. Then we use the MarianMT `Helsinki-NLP/opus-mt-{src}-{tgt}` checkpoint to translate the dataset into four different languages - English, French, German, and Spanish, keeping approximately 2.5M examples of each language.
 
@@ -92,12 +111,12 @@ Training image captioning that too multilingual was a difficult task and we face
 - The dataset has all `Person` type named entites masked as `<PERSON>`. While that is good for biases as we explain below, the dataset contains too many `<PERSON>` tags and the model results in `<PERSON><PERSON><PERSON>` sometimes for Person-related images.
 - Our captions are sometimes generic. Stating what is present in the image instead of generation well-formed and convoluted captions. Despite the training, the BLEU scores we achieve are not very great, which could be a reason for this. With higher BLEU scores, we can expect less-generic models.
 - English captions are sometimes better than other languages. This can be due to the fact that we limit sequence length of other languages to 64 (and now 128) while English text works fine. This could also be due to poor-quality translations which we wish to address in our next attempt.
-- 
+-
 ### Biases
 Due to the gender, racial, color and stereotypical biases in data, person identification by an image captioning model suffers. Also, the gender-activity bias, owing to the word-by-word prediction, influences other words in the caption prediction, resulting in the well-known problem of label bias.
 
 One of the reasons why we chose Conceptual 12M over COCO captioning dataset for training our Multi-lingual Image Captioning model was that in former all named entities of type Person were substituted by a special token <PERSON>. Because of this, the gendered terms in our captions became quite infrequent. We'll present a few captions from our model to analyse how our model performed on different images on which different pre-trained image captioning model usually gives gender prediction biases.
-  
+
 ## Conclusion, Future Work, and Social Impact
 ### Conclusion
 In this project, we presented Proof-of-Concept with our CLIP Vision + mBART-50 model baseline which leverages a multilingual checkpoint with pre-trained image encoders in four languages - **English, French, German, and Spanish**. Our models achieve a BLEU-1 score of around 0.14 which is decent considering the amount of training time we could get and how challenging multilingual training is.
@@ -111,14 +130,14 @@ We hope to improve this project in the future by using:
 - Accessibility: Making the model deployable on hand-held devices to make it more accessible. Currently, our model is too large to fit on mobile/edge devices because of which not many will be able to access it. However, our final goal is ensure everyone can access it without any computation barriers. Hopefully we'll be able to support TFLite for our model as well in future.
 - More models: We can combine several decoders with the CLIP-Vision encoder to get multilingual mdoels. We also wish to work with Marian models for language-specific captioning models, especially for low-resource languages.
 - Better training: We wish to experiment more with hyperparameters, optimizers, and learning rate schedulers to make the training work better. Our validation curve, as of now, plateaus in a very few epochs and we wish to address this issue.
-  
+
 ### Social Impact
 Our initial plan was to include 4 high-resource and 4 low-resource languages (Marathi, Bengali, Urdu, Telegu) in our training data. However, the existing translations do not perform as well and we would have received poor labels, not to mention, with a longer training time.
 
 Being able to automatically describe the content of an image using properly formed sentences in any language is a challenging task, but it could have great impact by helping visually impaired people better understand their surroundings.
 
 A slightly (not-so) long term use case would definitely be, explaining what happens in a video, frame by frame. One more recent use-case for the same can be generating surgical instructions. Since our model is multi-lingual which means the instructions will not be just limited to regions where English is spoken but those instructions can be perused in regions where Spanish, French and German are spoken as well. Further if we extend this project to low-resource languages then its impact can be manifold.
-  
+
 ## References
 ### Papers
 ```
@@ -199,9 +218,9 @@ A slightly (not-so) long term use case would definitely be, explaining what happ
 
 ### Useful Links
 - [Conceptual 12M Dataset](https://github.com/google-research-datasets/conceptual-12m)
-  
+
 - [Hybrid CLIP Example](https://github.com/huggingface/transformers/blob/master/src/transformers/models/clip/modeling_flax_clip.py)
-  
+
 - [BERT Modeling File](https://github.com/huggingface/transformers/blob/master/src/transformers/models/bert/modeling_flax_bert.py)
 
 - [CLIP Modeling File](https://github.com/huggingface/transformers/blob/master/src/transformers/models/clip/modeling_flax_clip.py)
